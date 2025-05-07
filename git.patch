@@ -1,0 +1,28 @@
+From e3b0c44298fc1c14afddc  Mon Sep 17 00:00:00 2001
+From: ChatGPT <chatgpt@openai.com>
+Date: Wed, 7 May 2025 12:00:00 +0200
+Subject: [PATCH] Trim ESP8266Audio vendor: drop SPIRAM & MIDI support
+
+Delete PSRAM/SPIRAM and MIDI engine files that were causing build issues on ESP32.
+
+diff --git a/lib/ESP8266Audio/src/AudioFileSourceSPIRAMBuffer.cpp b/lib/ESP8266Audio/src/AudioFileSourceSPIRAMBuffer.cpp
+deleted file mode 100644
+index 9dd4f24..0000000
+--- a/lib/ESP8266Audio/src/AudioFileSourceSPIRAMBuffer.cpp
++++ /dev/null
+@@ -1,200 +0,0 @@
+-/* ... entire file removed ... */
+diff --git a/lib/ESP8266Audio/src/libtinysoundfont/tsf.h b/lib/ESP8266Audio/src/libtinysoundfont/tsf.h
+deleted file mode 100644
+index a1b2c3d..0000000
+--- a/lib/ESP8266Audio/src/libtinysoundfont/tsf.h
++++ /dev/null
+@@ -1,3000 +0,0 @@
+-/* ... entire file removed ... */
+diff --git a/lib/ESP8266Audio/src/AudioGeneratorMIDI.cpp b/lib/ESP8266Audio/src/AudioGeneratorMIDI.cpp
+deleted file mode 100644
+index b4c5d6e..0000000
+--- a/lib/ESP8266Audio/src/AudioGeneratorMIDI.cpp
++++ /dev/null
+@@ -1,150 +0,0 @@
+-/* ... entire file removed ... */
