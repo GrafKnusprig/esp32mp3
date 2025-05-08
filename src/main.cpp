@@ -56,7 +56,17 @@ int orderPos = 0;
 int current = -1;
 bool isPlaying = false;
 unsigned long lastBookmarkMs = 0;
-float volumeLevel = 0.25f;
+
+// define your fixed steps
+const float volSteps[] = {
+    0.02f, 0.03f, 0.04f, 0.05f,
+    0.10f, 0.15f, 0.20f, 0.25f,
+    0.30f, 0.40f, 0.50f, 0.60f,
+    0.70f, 0.80f, 0.90f, 1.00f};
+const int VOL_COUNT = sizeof(volSteps) / sizeof(volSteps[0]);
+
+// track which step you’re on
+int volIndex = 7; // start at 0.05 (index 3)
 
 QueueHandle_t bookmarkQueue;
 File bookmarkFile;
@@ -205,7 +215,7 @@ void setup()
   LOGLN("✅ SD OK");
 
   audioOut.SetPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
-  audioOut.SetGain(volumeLevel); // -12 dB attenuation
+  audioOut.SetGain(volSteps[volIndex]);
   audioOut.begin();
   LOGLN("✅ I²S OK");
 
@@ -335,22 +345,22 @@ void loop()
   // Volume Up?
   if (checkButton(BTN_VOL_UP, lastUpState, lastUpDebounce, upPressed, now))
   {
-    if (volumeLevel < 1.0f)
+    if (volIndex < VOL_COUNT - 1)
     {
-      volumeLevel = min(1.0f, volumeLevel + 0.05f);
-      audioOut.SetGain(volumeLevel);
-      LOG("🔊 Vol: %.1f\n", volumeLevel);
+      volIndex++;
+      audioOut.SetGain(volSteps[volIndex]);
+      LOG("🔊 Vol: %.2f\n", volSteps[volIndex]);
     }
   }
 
   // Volume Down?
   if (checkButton(BTN_VOL_DN, lastDnState, lastDnDebounce, dnPressed, now))
   {
-    if (volumeLevel > 0.05f)
+    if (volIndex > 0)
     {
-      volumeLevel = max(0.05f, volumeLevel - 0.05f);
-      audioOut.SetGain(volumeLevel);
-      LOG("🔉 Vol: %.1f\n", volumeLevel);
+      volIndex--;
+      audioOut.SetGain(volSteps[volIndex]);
+      LOG("🔉 Vol: %.2f\n", volSteps[volIndex]);
     }
   }
 }
