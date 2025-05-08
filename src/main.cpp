@@ -3,14 +3,12 @@
 #include <AudioFileSourceSD.h>
 #include <AudioGeneratorMP3.h>
 #include <AudioOutputI2S.h>
-#include "esp_system.h" // esp_random()
+#include "esp_system.h"
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
-#include <cstdio> // sscanf()
+#include <cstdio>
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Toggle this to 0 to remove all Serial output in production:
-#define SERIAL_OUTPUT 0
+#define SERIAL_OUTPUT 1
 
 #if SERIAL_OUTPUT
 #define LOG(...) Serial.printf(__VA_ARGS__)
@@ -19,15 +17,12 @@
 #define LOG(...) (void)0
 #define LOGLN(...) (void)0
 #endif
-// ──────────────────────────────────────────────────────────────────────────────
 
-// pins
 #define SD_CS 5
 #define I2S_BCLK 26
 #define I2S_LRC 25
 #define I2S_DOUT 22
 
-// globals
 AudioFileSourceSD fileSrc;
 AudioGeneratorMP3 mp3;
 AudioOutputI2S audioOut;
@@ -36,20 +31,14 @@ int current = -1;
 bool isPlaying = false;
 unsigned long lastBookmarkMs = 0;
 
-// queue for bookmark positions
 QueueHandle_t bookmarkQueue;
 
-// scan SD root for MP3s
-void loadTracks()
-{
+void loadTracks() {
   File root = SD.open("/");
-  while (File f = root.openNextFile())
-  {
-    if (!f.isDirectory())
-    {
+  while (File f = root.openNextFile()) {
+    if (!f.isDirectory()) {
       String n = f.name();
-      if (n.endsWith(".mp3") || n.endsWith(".MP3"))
-      {
+      if (n.endsWith(".mp3") || n.endsWith(".MP3")) {
         tracks.push_back("/" + n);
       }
     }
@@ -59,30 +48,23 @@ void loadTracks()
   LOG("Found %u tracks\n", (unsigned)tracks.size());
 }
 
-// pick a new random index ≠ current
-int getRandomIndex()
-{
+int getRandomIndex() {
   if (tracks.size() < 2)
     return 0;
   int nxt;
-  do
-  {
+  do {
     nxt = esp_random() % tracks.size();
   } while (nxt == current);
   return nxt;
 }
 
-// background task: write bookmarks to SD
-void bookmarkTask(void *pv)
-{
+void bookmarkTask(void *pv) {
   uint32_t pos;
-  for (;;)
-  {
-    if (xQueueReceive(bookmarkQueue, &pos, portMAX_DELAY) == pdTRUE)
-    {
+  for (;;) {
+    if (xQueueReceive(bookmarkQueue, &pos, portMAX_DELAY) == pdTRUE) {
+      if (!isPlaying) continue;
       File b = SD.open("/bookmark.txt", FILE_WRITE);
-      if (b)
-      {
+      if (b) {
         b.printf("%d %u\n", current, pos);
         b.close();
       }
@@ -90,9 +72,7 @@ void bookmarkTask(void *pv)
   }
 }
 
-// read "<idx> <byteOffset>" from bookmark.txt
-bool readBookmark(int &idx, uint32_t &off)
-{
+bool readBookmark(int &idx, uint32_t &off) {
   if (!SD.exists("/bookmark.txt"))
     return false;
   File b = SD.open("/bookmark.txt");
@@ -104,14 +84,11 @@ bool readBookmark(int &idx, uint32_t &off)
   return (read == 2 && idx >= 0 && idx < (int)tracks.size());
 }
 
-// open and optionally seek, then begin decode
-void playTrack(int idx, uint32_t off = 0)
-{
+void playTrack(int idx, uint32_t off = 0) {
   current = idx;
   String &path = tracks[idx];
   LOG("▶️  Track %u: %s  (seek %u bytes)\n", idx, path.c_str(), off);
-  if (!fileSrc.open(path.c_str()))
-  {
+  if (!fileSrc.open(path.c_str())) {
     LOGLN("❌ file open failed");
     return;
   }
@@ -121,81 +98,66 @@ void playTrack(int idx, uint32_t off = 0)
   isPlaying = mp3.isRunning();
 }
 
-// shuffle to a new track
-void nextTrack()
-{
+void nextTrack() {
   playTrack(getRandomIndex(), 0);
 }
 
-void setup()
-{
+void setup() {
 #if SERIAL_OUTPUT
   Serial.begin(115200);
-  while (!Serial)
-  {
-  }
+  while (!Serial) {}
   LOGLN("\n=== MP3 Shuffle w/ No-Stutter Bookmark ===");
 #endif
 
-  if (!SD.begin(SD_CS))
-  {
+  if (!SD.begin(SD_CS)) {
     LOGLN("❌ SD init failed");
     while (1)
       delay(1000);
   }
   LOGLN("✅ SD OK");
 
+  audioOut.SetPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
+  audioOut.SetGain(0.25f); // -12 dB attenuation
   audioOut.begin();
   LOGLN("✅ I²S OK");
 
   loadTracks();
-  if (tracks.empty())
-  {
+  if (tracks.empty()) {
     LOGLN("❌ No MP3s");
     while (1)
       delay(1000);
   }
 
-  // resume if we have a bookmark
   int idx;
   uint32_t off;
-  if (readBookmark(idx, off))
-  {
+  if (readBookmark(idx, off)) {
     LOG("🔖 Resume track %d @ byte %u\n", idx, off);
     playTrack(idx, off);
-  }
-  else
-  {
+  } else {
     nextTrack();
   }
 
-  // create queue + background task
   bookmarkQueue = xQueueCreate(5, sizeof(uint32_t));
-  xTaskCreatePinnedToCore(
-      bookmarkTask, "bookmarkTask", 4096,
-      NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(bookmarkTask, "bookmarkTask", 4096, NULL, 1, NULL, 0);
 }
 
-void loop()
-{
-  if (isPlaying)
-  {
-    if (mp3.isRunning())
-    {
+void loop() {
+  if (isPlaying) {
+    if (mp3.isRunning()) {
       mp3.loop();
-      // enqueue bookmark every 5s without blocking
       unsigned long now = millis();
-      if (now - lastBookmarkMs > 5000)
-      {
+      if (now - lastBookmarkMs > 5000) {
         uint32_t pos = fileSrc.getPos();
-        xQueueSend(bookmarkQueue, &pos, 0);
-        lastBookmarkMs = now;
-        LOG("✏️ Queued bookmark %u @ %u bytes\n", current, pos);
+        if (pos > 0) {
+          xQueueSend(bookmarkQueue, &pos, 0);
+          lastBookmarkMs = now;
+          LOG("✏️ Queued bookmark %u @ %u bytes\n", current, pos);
+        }
       }
-    }
-    else
-    {
+    } else {
       LOGLN("🔁 Track ended, shuffling...");
+      isPlaying = false;
+      SD.remove("/bookmark.txt");
       nextTrack();
     }
   }
