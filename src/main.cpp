@@ -8,6 +8,26 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #include <cstdio>
+#include <WiFi.h>
+
+// ESP32 Dev Kit                   SD Card Module
+// ┌──────────────┐                ┌─────────────┐
+// │        3.3V  ────────────────▶│ VCC         │
+// │         GND  ────────────────▶│ GND         │
+// │        GPIO19◀────────────────│ MISO        │
+// │        GPIO23────────────────▶│ MOSI        │
+// │        GPIO18────────────────▶│ SCK         │
+// │         GPIO5────────────────▶│ CS          │
+// └──────────────┘                └─────────────┘
+
+// ESP32 Dev Kit                   PCM5100 DAC Module
+// ┌──────────────┐                ┌─────────────┐
+// │        3.3V  ────────────────▶│ VCC         │
+// │         GND  ────────────────▶│ GND         │
+// │        GPIO22────────────────▶│ DIN (DATA)  │
+// │        GPIO26────────────────▶│ BCK (BITCLK)│
+// │        GPIO25────────────────▶│ LRC (LRCLK) │
+// └──────────────┘                └─────────────┘
 
 #define SERIAL_OUTPUT 1
 
@@ -123,6 +143,8 @@ void nextTrack()
 
 void setup()
 {
+  WiFi.mode(WIFI_OFF);
+  btStop();
 #if SERIAL_OUTPUT
   Serial.begin(115200);
   while (!Serial)
