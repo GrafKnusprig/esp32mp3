@@ -49,12 +49,33 @@ AudioFileSourceSD fileSrc;
 AudioGeneratorMP3 mp3;
 AudioOutputI2S audioOut;
 std::vector<String> tracks;
+std::vector<int> playOrder;
+int orderPos = 0;
 int current = -1;
 bool isPlaying = false;
 unsigned long lastBookmarkMs = 0;
 
 QueueHandle_t bookmarkQueue;
 File bookmarkFile;
+
+void shuffleOrder(int excludeIdx = -1)
+{
+  playOrder.clear();
+  for (int i = 0; i < (int)tracks.size(); i++)
+  {
+    if (i != excludeIdx)
+      playOrder.push_back(i);
+  }
+  // Fisher–Yates
+  for (int i = playOrder.size() - 1; i > 0; i--)
+  {
+    int j = esp_random() % (i + 1);
+    std::swap(playOrder[i], playOrder[j]);
+  }
+  orderPos = 0;
+  LOG("🔀 Playlist shuffled%s\n",
+      excludeIdx >= 0 ? " (excluding resumed track)" : "");
+}
 
 void loadTracks()
 {
@@ -139,7 +160,22 @@ void playTrack(int idx, uint32_t off = 0)
 
 void nextTrack()
 {
-  playTrack(getRandomIndex(), 0);
+  // stop current decode & close file
+  if (mp3.isRunning())
+  {
+    mp3.stop();
+  }
+  fileSrc.close();
+
+  orderPos++;
+  if (orderPos >= (int)playOrder.size())
+  {
+    shuffleOrder();
+  }
+
+  // pick & start a fresh one
+  // int nxt = getRandomIndex();
+  playTrack(playOrder[orderPos], 0);
 }
 
 void setup()
@@ -183,10 +219,12 @@ void setup()
   if (readBookmark(idx, off))
   {
     LOG("🔖 Resume track %d @ byte %u\n", idx, off);
+    shuffleOrder(idx);
     playTrack(idx, off);
   }
   else
   {
+    shuffleOrder();
     nextTrack();
   }
 
