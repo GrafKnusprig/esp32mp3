@@ -44,6 +44,8 @@
 #define I2S_LRC 25
 #define I2S_DOUT 22
 #define BTN_NEXT 32
+#define BTN_VOL_UP 33
+#define BTN_VOL_DN 27
 
 AudioFileSourceSD fileSrc;
 AudioGeneratorMP3 mp3;
@@ -54,6 +56,7 @@ int orderPos = 0;
 int current = -1;
 bool isPlaying = false;
 unsigned long lastBookmarkMs = 0;
+float volumeLevel = 0.25f;
 
 QueueHandle_t bookmarkQueue;
 File bookmarkFile;
@@ -202,7 +205,7 @@ void setup()
   LOGLN("✅ SD OK");
 
   audioOut.SetPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
-  audioOut.SetGain(0.25f); // -12 dB attenuation
+  audioOut.SetGain(volumeLevel); // -12 dB attenuation
   audioOut.begin();
   LOGLN("✅ I²S OK");
 
@@ -237,13 +240,46 @@ void setup()
 
   // button setup
   pinMode(BTN_NEXT, INPUT_PULLUP);
+  pinMode(BTN_VOL_UP, INPUT_PULLUP);
+  pinMode(BTN_VOL_DN, INPUT_PULLUP);
 
   bookmarkQueue = xQueueCreate(5, sizeof(uint32_t));
   xTaskCreatePinnedToCore(bookmarkTask, "bookmarkTask", 4096, NULL, 1, NULL, 0);
 }
 
+// Debounce+edge helper: returns true once when pin goes HIGH→LOW
+bool checkButton(uint8_t pin,
+                 bool &lastState,
+                 unsigned long &lastDebounce,
+                 bool &pressed,
+                 unsigned long now)
+{
+  const unsigned long DEBOUNCE = 50;
+  bool reading = digitalRead(pin);
+  if (reading != lastState)
+  {
+    lastDebounce = now;
+  }
+  if (now - lastDebounce > DEBOUNCE)
+  {
+    if (reading == LOW && !pressed)
+    {
+      pressed = true;
+      lastState = reading;
+      return true;
+    }
+    if (reading == HIGH)
+    {
+      pressed = false;
+    }
+  }
+  lastState = reading;
+  return false;
+}
+
 void loop()
 {
+  unsigned long now = millis();
   if (isPlaying)
   {
     if (mp3.isRunning())
@@ -285,34 +321,36 @@ void loop()
     }
   }
 
-  // Single-skip on a button press with debounce
-  static bool lastNextState = HIGH;
-  static unsigned long lastDebounceTime = 0;
-  const unsigned long debounceDelay = 50; // ms
+  // Static state per button
+  static bool lastNextState = HIGH, lastUpState = HIGH, lastDnState = HIGH;
+  static unsigned long lastNextDebounce = 0, lastUpDebounce = 0, lastDnDebounce = 0;
+  static bool nextPressed = false, upPressed = false, dnPressed = false;
 
-  bool reading = digitalRead(BTN_NEXT);
-  if (reading != lastNextState)
+  // Skip button?
+  if (checkButton(BTN_NEXT, lastNextState, lastNextDebounce, nextPressed, now))
   {
-    // reset the debounce timer on any state change
-    lastDebounceTime = millis();
+    nextTrack();
   }
 
-  // only consider the reading if it's been stable for longer than the debounce delay
-  if (millis() - lastDebounceTime > debounceDelay)
+  // Volume Up?
+  if (checkButton(BTN_VOL_UP, lastUpState, lastUpDebounce, upPressed, now))
   {
-    // if the button went from HIGH to LOW, it's a press
-    static bool buttonPressed = false;
-    if (reading == LOW && !buttonPressed)
+    if (volumeLevel < 1.0f)
     {
-      nextTrack();
-      buttonPressed = true;
-    }
-    // when the button is released, allow the next press
-    if (reading == HIGH)
-    {
-      buttonPressed = false;
+      volumeLevel = min(1.0f, volumeLevel + 0.05f);
+      audioOut.SetGain(volumeLevel);
+      LOG("🔊 Vol: %.1f\n", volumeLevel);
     }
   }
 
-  lastNextState = reading;
+  // Volume Down?
+  if (checkButton(BTN_VOL_DN, lastDnState, lastDnDebounce, dnPressed, now))
+  {
+    if (volumeLevel > 0.05f)
+    {
+      volumeLevel = max(0.05f, volumeLevel - 0.05f);
+      audioOut.SetGain(volumeLevel);
+      LOG("🔉 Vol: %.1f\n", volumeLevel);
+    }
+  }
 }
