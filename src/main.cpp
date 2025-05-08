@@ -43,6 +43,7 @@
 #define I2S_BCLK 26
 #define I2S_LRC 25
 #define I2S_DOUT 22
+#define BTN_NEXT 32
 
 AudioFileSourceSD fileSrc;
 AudioGeneratorMP3 mp3;
@@ -196,6 +197,9 @@ void setup()
     LOGLN("❌ Failed to open bookmark.txt for writing");
   }
 
+  // button setup
+  pinMode(BTN_NEXT, INPUT_PULLUP);
+
   bookmarkQueue = xQueueCreate(5, sizeof(uint32_t));
   xTaskCreatePinnedToCore(bookmarkTask, "bookmarkTask", 4096, NULL, 1, NULL, 0);
 }
@@ -242,4 +246,35 @@ void loop()
       nextTrack();
     }
   }
+
+  // Single-skip on a button press with debounce
+  static bool lastNextState = HIGH;
+  static unsigned long lastDebounceTime = 0;
+  const unsigned long debounceDelay = 50; // ms
+
+  bool reading = digitalRead(BTN_NEXT);
+  if (reading != lastNextState)
+  {
+    // reset the debounce timer on any state change
+    lastDebounceTime = millis();
+  }
+
+  // only consider the reading if it's been stable for longer than the debounce delay
+  if (millis() - lastDebounceTime > debounceDelay)
+  {
+    // if the button went from HIGH to LOW, it's a press
+    static bool buttonPressed = false;
+    if (reading == LOW && !buttonPressed)
+    {
+      nextTrack();
+      buttonPressed = true;
+    }
+    // when the button is released, allow the next press
+    if (reading == HIGH)
+    {
+      buttonPressed = false;
+    }
+  }
+
+  lastNextState = reading;
 }
