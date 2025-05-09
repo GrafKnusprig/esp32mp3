@@ -78,6 +78,25 @@ int volIndex = 7; // start at 0.05 (index 3)
 QueueHandle_t bookmarkQueue;
 File bookmarkFile;
 
+void updateShuffleFile()
+{
+  File shuffleFile = SD.open("/shuffle.txt", FILE_WRITE);
+  if (shuffleFile)
+  {
+    shuffleFile.printf("orderPos:%d\n", orderPos);
+    for (int idx : playOrder)
+    {
+      shuffleFile.printf("%d\n", idx);
+    }
+    shuffleFile.close();
+    LOG("✅ Shuffle file updated\n");
+  }
+  else
+  {
+    LOG("❌ Failed to update shuffle.txt\n");
+  }
+}
+
 void shuffleOrder(int excludeIdx = -1)
 {
   playOrder.clear();
@@ -93,25 +112,95 @@ void shuffleOrder(int excludeIdx = -1)
     std::swap(playOrder[i], playOrder[j]);
   }
   orderPos = 0;
-  LOG("🔀 Playlist shuffled%s\n",
-      excludeIdx >= 0 ? " (excluding resumed track)" : "");
+
+  updateShuffleFile();
+  LOG("✅ Shuffle list generated with %d tracks\n", (int)playOrder.size());
+}
+
+void validateShuffleList()
+{
+  if (playOrder.size() != tracks.size())
+  {
+    LOG("❌ Shuffle list size mismatch. Regenerating shuffle...\n");
+    shuffleOrder();
+  }
+}
+
+void loadShuffleFile(int excludeIdx = -1)
+{
+  if (!SD.exists("/shuffle.txt"))
+  {
+    LOG("❌ shuffle.txt not found\n");
+    return;
+  }
+
+  File shuffleFile = SD.open("/shuffle.txt", FILE_READ);
+  if (!shuffleFile)
+  {
+    LOG("❌ Failed to open shuffle.txt\n");
+    return;
+  }
+
+  playOrder.clear();
+  String firstLine = shuffleFile.readStringUntil('\n');
+  if (firstLine.startsWith("orderPos:"))
+  {
+    orderPos = firstLine.substring(9).toInt();
+  }
+  else
+  {
+    LOG("❌ Invalid shuffle.txt format\n");
+    shuffleFile.close();
+    shuffleOrder(excludeIdx);
+    return;
+  }
+
+  while (shuffleFile.available())
+  {
+    int idx = shuffleFile.readStringUntil('\n').toInt();
+    if (idx >= 0 && idx < (int)tracks.size())
+    {
+      playOrder.push_back(idx);
+    }
+  }
+  shuffleFile.close();
+
+  if (playOrder.empty())
+  {
+    LOG("❌ shuffle.txt is empty or invalid\n");
+    shuffleOrder(excludeIdx);
+  }
+  else
+  {
+    validateShuffleList();
+    LOG("✅ Loaded shuffle.txt with %d tracks, starting at position %d\n", (int)playOrder.size(), orderPos);
+  }
+}
+
+void loadTracksRecursive(File dir, String path = "")
+{
+  while (File f = dir.openNextFile())
+  {
+    if (f.isDirectory())
+    {
+      loadTracksRecursive(f, path + "/" + f.name());
+    }
+    else
+    {
+      String n = f.name();
+      if (n.endsWith(".mp3") || n.endsWith(".MP3"))
+      {
+        tracks.push_back(path + "/" + n);
+      }
+    }
+    f.close();
+  }
 }
 
 void loadTracks()
 {
   File root = SD.open("/");
-  while (File f = root.openNextFile())
-  {
-    if (!f.isDirectory())
-    {
-      String n = f.name();
-      if (n.endsWith(".mp3") || n.endsWith(".MP3"))
-      {
-        tracks.push_back("/" + n);
-      }
-    }
-    f.close();
-  }
+  loadTracksRecursive(root);
   root.close();
   LOG("Found %u tracks\n", (unsigned)tracks.size());
 }
@@ -188,6 +277,7 @@ void nextTrack()
   fileSrc.close();
 
   orderPos++;
+  updateShuffleFile();
   if (orderPos >= (int)playOrder.size())
   {
     shuffleOrder();
@@ -239,7 +329,7 @@ void setup()
   if (readBookmark(idx, off))
   {
     LOG("🔖 Resume track %d @ byte %u\n", idx, off);
-    shuffleOrder(idx);
+    loadShuffleFile();
     playTrack(idx, off);
   }
   else
@@ -371,3 +461,4 @@ void loop()
     }
   }
 }
+
