@@ -3,6 +3,8 @@
 #include <SPI.h>
 #include <AudioFileSourceSD.h>
 #include <AudioGeneratorMP3.h>
+#include <AudioGeneratorWAV.h>
+#include <AudioGeneratorFLAC.h>
 #include <AudioOutputI2S.h>
 #include "esp_system.h"
 #include <freertos/FreeRTOS.h>
@@ -31,7 +33,6 @@
 
 // ESP32 Dev Kit                   Buttons
 // ┌──────────────┐                ┌─────────────┐
-// │        GPIO32────────────────▶│ BTN_NEXT    │
 // │        GPIO33────────────────▶│ BTN_VOL_UP  │
 // │        GPIO27────────────────▶│ BTN_VOL_DN  │
 // └──────────────┘                └─────────────┘
@@ -55,7 +56,17 @@
 
 AudioFileSourceSD fileSrc;
 AudioGeneratorMP3 mp3;
+AudioGeneratorWAV wav;
+AudioGeneratorFLAC flac;
 AudioOutputI2S audioOut;
+enum AudioType
+{
+  TYPE_MP3,
+  TYPE_WAV,
+  TYPE_FLAC,
+  TYPE_UNKNOWN
+};
+AudioType currentType = TYPE_UNKNOWN;
 std::vector<String> tracks;
 std::vector<int> playOrder;
 int orderPos = 0;
@@ -190,7 +201,8 @@ void loadTracksRecursive(File dir, String path = "")
     else
     {
       String n = f.name();
-      if (n.endsWith(".mp3") || n.endsWith(".MP3"))
+      if (n.endsWith(".mp3") || n.endsWith(".MP3") || n.endsWith(".wav") || n.endsWith(".WAV") ||
+          n.endsWith(".flac") || n.endsWith(".FLAC"))
       {
         tracks.push_back(path + "/" + n);
       }
@@ -255,24 +267,49 @@ bool readBookmark(int &idx, uint32_t &off)
 
 void playTrack(int idx, uint32_t off = 0)
 {
-  // stop current decode & close file
   if (mp3.isRunning())
-  {
     mp3.stop();
-  }
+  if (wav.isRunning())
+    wav.stop();
+  if (flac.isRunning())
+    flac.stop();
   fileSrc.close();
+
   current = idx;
   String &path = tracks[idx];
   LOG("▶️  Track %u: %s  (seek %u bytes)\n", idx, path.c_str(), off);
+
   if (!fileSrc.open(path.c_str()))
   {
     LOGLN("❌ file open failed");
     return;
   }
-  if (off)
-    fileSrc.seek(off, SEEK_SET);
-  mp3.begin(&fileSrc, &audioOut);
-  isPlaying = mp3.isRunning();
+
+  if (path.endsWith(".mp3") || path.endsWith(".MP3"))
+  {
+    currentType = TYPE_MP3;
+    if (off)
+      fileSrc.seek(off, SEEK_SET);
+    mp3.begin(&fileSrc, &audioOut);
+    isPlaying = mp3.isRunning();
+  }
+  else if (path.endsWith(".wav") || path.endsWith(".WAV"))
+  {
+    currentType = TYPE_WAV;
+    wav.begin(&fileSrc, &audioOut);
+    isPlaying = wav.isRunning();
+  }
+  else if (path.endsWith(".flac") || path.endsWith(".FLAC"))
+  {
+    currentType = TYPE_FLAC;
+    flac.begin(&fileSrc, &audioOut);
+    isPlaying = flac.isRunning();
+  }
+  else
+  {
+    currentType = TYPE_UNKNOWN;
+    LOGLN("❌ unsupported file type");
+  }
 }
 
 void nextTrack()
@@ -365,42 +402,45 @@ void loop()
   static unsigned long lastPrevPressTime = 0;
   if (isPlaying)
   {
-    if (mp3.isRunning())
+    bool active = false;
+    switch (currentType)
     {
-      bool active = mp3.loop();
-
-      if (!active)
-      {
-        LOGLN("⏹️ loop() returned false — decoder done");
-        isPlaying = false;
-        uint32_t flushDummy = fileSrc.getPos();
-        xQueueSend(bookmarkQueue, &flushDummy, 0);
-        delay(10);
-        nextTrack();
-        return;
-      }
-
-      unsigned long now = millis();
-      uint32_t pos = fileSrc.getPos();
-
-      if (now - lastBookmarkMs > 5000)
-      {
-        if (pos > 0)
-        {
-          xQueueSend(bookmarkQueue, &pos, 0);
-          lastBookmarkMs = now;
-          LOG("✏️ Queued bookmark %u @ %u bytes\n", current, pos);
-        }
-      }
+    case TYPE_MP3:
+      active = mp3.loop();
+      break;
+    case TYPE_WAV:
+      active = wav.loop();
+      break;
+    case TYPE_FLAC:
+      active = flac.loop();
+      break;
+    default:
+      active = false;
+      break;
     }
-    else
+
+    if (!active)
     {
-      LOGLN("🔁 Track ended, shuffling...");
+      LOGLN("⏹️ loop() returned false — decoder done");
       isPlaying = false;
       uint32_t flushDummy = fileSrc.getPos();
       xQueueSend(bookmarkQueue, &flushDummy, 0);
       delay(10);
       nextTrack();
+      return;
+    }
+
+    unsigned long now = millis();
+    uint32_t pos = fileSrc.getPos();
+
+    if (now - lastBookmarkMs > 5000)
+    {
+      if (pos > 0)
+      {
+        xQueueSend(bookmarkQueue, &pos, 0);
+        lastBookmarkMs = now;
+        LOG("✏️ Queued bookmark %u @ %u bytes\n", current, pos);
+      }
     }
   }
 
