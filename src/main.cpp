@@ -50,7 +50,6 @@
 #define I2S_BCLK 26
 #define I2S_LRC 25
 #define I2S_DOUT 22
-#define BTN_NEXT 32
 #define BTN_VOL_UP 33
 #define BTN_VOL_DN 27
 
@@ -74,6 +73,9 @@ const int VOL_COUNT = sizeof(volSteps) / sizeof(volSteps[0]);
 
 // track which step you’re on
 int volIndex = 7; // start at 0.05 (index 3)
+
+bool lastUpState = HIGH, lastDnState = HIGH;
+bool upHeld = false, dnHeld = false;
 
 QueueHandle_t bookmarkQueue;
 File bookmarkFile;
@@ -253,6 +255,12 @@ bool readBookmark(int &idx, uint32_t &off)
 
 void playTrack(int idx, uint32_t off = 0)
 {
+  // stop current decode & close file
+  if (mp3.isRunning())
+  {
+    mp3.stop();
+  }
+  fileSrc.close();
   current = idx;
   String &path = tracks[idx];
   LOG("▶️  Track %u: %s  (seek %u bytes)\n", idx, path.c_str(), off);
@@ -269,13 +277,6 @@ void playTrack(int idx, uint32_t off = 0)
 
 void nextTrack()
 {
-  // stop current decode & close file
-  if (mp3.isRunning())
-  {
-    mp3.stop();
-  }
-  fileSrc.close();
-
   orderPos++;
   updateShuffleFile();
   if (orderPos >= (int)playOrder.size())
@@ -283,8 +284,6 @@ void nextTrack()
     shuffleOrder();
   }
 
-  // pick & start a fresh one
-  // int nxt = getRandomIndex();
   playTrack(playOrder[orderPos], 0);
 }
 
@@ -329,12 +328,12 @@ void setup()
   if (readBookmark(idx, off))
   {
     LOG("🔖 Resume track %d @ byte %u\n", idx, off);
-    loadShuffleFile();
+    loadShuffleFile(idx);
     playTrack(idx, off);
   }
   else
   {
-    shuffleOrder();
+    loadShuffleFile();
     nextTrack();
   }
 
@@ -346,47 +345,24 @@ void setup()
   }
 
   // button setup
-  pinMode(BTN_NEXT, INPUT_PULLUP);
   pinMode(BTN_VOL_UP, INPUT_PULLUP);
   pinMode(BTN_VOL_DN, INPUT_PULLUP);
 
   bookmarkQueue = xQueueCreate(5, sizeof(uint32_t));
   xTaskCreatePinnedToCore(bookmarkTask, "bookmarkTask", 4096, NULL, 1, NULL, 0);
-}
 
-// Debounce+edge helper: returns true once when pin goes HIGH→LOW
-bool checkButton(uint8_t pin,
-                 bool &lastState,
-                 unsigned long &lastDebounce,
-                 bool &pressed,
-                 unsigned long now)
-{
-  const unsigned long DEBOUNCE = 50;
-  bool reading = digitalRead(pin);
-  if (reading != lastState)
-  {
-    lastDebounce = now;
-  }
-  if (now - lastDebounce > DEBOUNCE)
-  {
-    if (reading == LOW && !pressed)
-    {
-      pressed = true;
-      lastState = reading;
-      return true;
-    }
-    if (reading == HIGH)
-    {
-      pressed = false;
-    }
-  }
-  lastState = reading;
-  return false;
+  extern bool lastUpState, lastDnState;
+  extern bool upHeld, dnHeld;
+  lastUpState = digitalRead(BTN_VOL_UP);
+  lastDnState = digitalRead(BTN_VOL_DN);
+  upHeld = lastUpState;
+  dnHeld = lastDnState;
 }
 
 void loop()
 {
   unsigned long now = millis();
+  static unsigned long lastPrevPressTime = 0;
   if (isPlaying)
   {
     if (mp3.isRunning())
@@ -428,37 +404,140 @@ void loop()
     }
   }
 
-  // Static state per button
-  static bool lastNextState = HIGH, lastUpState = HIGH, lastDnState = HIGH;
-  static unsigned long lastNextDebounce = 0, lastUpDebounce = 0, lastDnDebounce = 0;
-  static bool nextPressed = false, upPressed = false, dnPressed = false;
+  // Debounce and state for buttons
+  const unsigned long debounceDelay = 50;
+  static unsigned long lastUpDebounceTime = 0;
+  static unsigned long lastDnDebounceTime = 0;
+  static unsigned long downTimeUp = 0, downTimeDn = 0;
+  static bool upActionTriggered = false, dnActionTriggered = false;
 
-  // Skip button?
-  if (checkButton(BTN_NEXT, lastNextState, lastNextDebounce, nextPressed, now))
+  // Volume Up / Skip with debounce
+  bool upReading = digitalRead(BTN_VOL_UP);
+  if (upReading != lastUpState)
   {
-    nextTrack();
+    lastUpDebounceTime = now;
   }
-
-  // Volume Up?
-  if (checkButton(BTN_VOL_UP, lastUpState, lastUpDebounce, upPressed, now))
+  if ((now - lastUpDebounceTime) > debounceDelay)
   {
-    if (volIndex < VOL_COUNT - 1)
+    if (upReading != upHeld)
     {
-      volIndex++;
-      audioOut.SetGain(volSteps[volIndex]);
-      LOG("🔊 Vol: %.2f\n", volSteps[volIndex]);
+      upHeld = upReading;
+      if (upHeld == LOW)
+      {
+        downTimeUp = now;
+        upActionTriggered = false;
+      }
+      else
+      {
+        if (!upActionTriggered)
+        {
+          unsigned long heldTime = now - downTimeUp;
+          if (heldTime > 1500)
+          {
+            nextTrack();
+          }
+          else if (volIndex < VOL_COUNT - 1)
+          {
+            volIndex++;
+            audioOut.SetGain(volSteps[volIndex]);
+            LOG("🔊 Vol: %.2f\n", volSteps[volIndex]);
+          }
+        }
+      }
+    }
+
+    if (upHeld == LOW && !upActionTriggered)
+    {
+      unsigned long heldTime = now - downTimeUp;
+      if (heldTime > 1500)
+      {
+        nextTrack();
+        upActionTriggered = true;
+      }
     }
   }
+  lastUpState = upReading;
 
-  // Volume Down?
-  if (checkButton(BTN_VOL_DN, lastDnState, lastDnDebounce, dnPressed, now))
+  // Volume Down / Restart or Previous with debounce
+  bool dnReading = digitalRead(BTN_VOL_DN);
+  if (dnReading != lastDnState)
   {
-    if (volIndex > 0)
+    lastDnDebounceTime = now;
+  }
+  if ((now - lastDnDebounceTime) > debounceDelay)
+  {
+    if (dnReading != dnHeld)
     {
-      volIndex--;
-      audioOut.SetGain(volSteps[volIndex]);
-      LOG("🔉 Vol: %.2f\n", volSteps[volIndex]);
+      dnHeld = dnReading;
+      if (dnHeld == LOW)
+      {
+        downTimeDn = now;
+        dnActionTriggered = false;
+      }
+      else
+      {
+        if (!dnActionTriggered)
+        {
+          unsigned long heldTime = now - downTimeDn;
+          if (heldTime > 1500)
+          {
+            unsigned long timeSinceLast = now - lastPrevPressTime;
+            lastPrevPressTime = now;
+
+            if (timeSinceLast < 10000)
+            {
+              if (orderPos > 0)
+              {
+                orderPos -= 2;
+                nextTrack();
+              }
+              else
+              {
+                playTrack(playOrder[orderPos], 0);
+              }
+            }
+            else
+            {
+              playTrack(playOrder[orderPos], 0);
+            }
+          }
+          else if (volIndex > 0)
+          {
+            volIndex--;
+            audioOut.SetGain(volSteps[volIndex]);
+            LOG("🔉 Vol: %.2f\n", volSteps[volIndex]);
+          }
+        }
+      }
+    }
+
+    if (dnHeld == LOW && !dnActionTriggered)
+    {
+      unsigned long heldTime = now - downTimeDn;
+      if (heldTime > 1500)
+      {
+        unsigned long timeSinceLast = now - lastPrevPressTime;
+        lastPrevPressTime = now;
+
+        if (timeSinceLast < 10000)
+        {
+          if (orderPos > 0)
+          {
+            orderPos -= 2;
+            nextTrack();
+          }
+          else
+          {
+            playTrack(playOrder[orderPos], 0);
+          }
+        }
+        else
+        {
+          playTrack(playOrder[orderPos], 0);
+        }
+        dnActionTriggered = true;
+      }
     }
   }
+  lastDnState = dnReading;
 }
-
