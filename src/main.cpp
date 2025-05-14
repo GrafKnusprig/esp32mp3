@@ -111,15 +111,36 @@ void updateShuffleFile()
   }
 }
 
+// Move blinkTaskHandle to global scope
+TaskHandle_t blinkTaskHandle = NULL;
 void blinkLed(int times)
 {
-  for (int i = 0; i < times; i++)
+  if (blinkTaskHandle != NULL)
   {
-    digitalWrite(LED_PIN, LOW);
-    delay(40);
-    digitalWrite(LED_PIN, HIGH);
-    delay(40);
+    if (eTaskGetState(blinkTaskHandle) != eDeleted)
+    {
+      vTaskDelete(blinkTaskHandle);
+    }
+    blinkTaskHandle = NULL;
   }
+
+  xTaskCreate(
+      [](void *param)
+      {
+        int times = *(int *)param;
+        delete (int *)param;
+
+        for (int i = 0; i < times; i++)
+        {
+          digitalWrite(LED_PIN, HIGH);
+          vTaskDelay(40 / portTICK_PERIOD_MS);
+          digitalWrite(LED_PIN, LOW);
+          vTaskDelay(40 / portTICK_PERIOD_MS);
+        }
+        vTaskDelete(NULL);
+        vTaskDelay(1);
+      },
+      "blinkTask", 1024, new int(times), 1, &blinkTaskHandle);
 }
 
 void shuffleOrder(int excludeIdx = -1)
@@ -397,7 +418,7 @@ void setup()
   pinMode(BTN_VOL_UP, INPUT_PULLUP);
   pinMode(BTN_VOL_DN, INPUT_PULLUP);
   pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, HIGH);
+  digitalWrite(LED_PIN, LOW); // LED off by default
 
   bookmarkQueue = xQueueCreate(5, sizeof(uint32_t));
   xTaskCreatePinnedToCore(bookmarkTask, "bookmarkTask", 4096, NULL, 1, NULL, 0);
