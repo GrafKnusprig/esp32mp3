@@ -53,6 +53,7 @@
 #define I2S_DOUT 22
 #define BTN_VOL_UP 33
 #define BTN_VOL_DN 27
+#define LED_PIN 2
 
 AudioFileSourceSD fileSrc;
 AudioGeneratorMP3 mp3;
@@ -107,6 +108,17 @@ void updateShuffleFile()
   else
   {
     LOG("❌ Failed to update shuffle.txt\n");
+  }
+}
+
+void blinkLed(int times)
+{
+  for (int i = 0; i < times; i++)
+  {
+    digitalWrite(LED_PIN, LOW);
+    delay(40);
+    digitalWrite(LED_PIN, HIGH);
+    delay(40);
   }
 }
 
@@ -384,6 +396,8 @@ void setup()
   // button setup
   pinMode(BTN_VOL_UP, INPUT_PULLUP);
   pinMode(BTN_VOL_DN, INPUT_PULLUP);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, HIGH);
 
   bookmarkQueue = xQueueCreate(5, sizeof(uint32_t));
   xTaskCreatePinnedToCore(bookmarkTask, "bookmarkTask", 4096, NULL, 1, NULL, 0);
@@ -475,11 +489,13 @@ void loop()
           if (heldTime > 1500)
           {
             nextTrack();
+            blinkLed(5);
           }
           else if (volIndex < VOL_COUNT - 1)
           {
             volIndex++;
             audioOut.SetGain(volSteps[volIndex]);
+            blinkLed(2);
             LOG("🔊 Vol: %.2f\n", volSteps[volIndex]);
           }
         }
@@ -492,6 +508,7 @@ void loop()
       if (heldTime > 1500)
       {
         nextTrack();
+        blinkLed(5);
         upActionTriggered = true;
       }
     }
@@ -530,21 +547,25 @@ void loop()
               {
                 orderPos -= 2;
                 nextTrack();
+                blinkLed(5);
               }
               else
               {
                 playTrack(playOrder[orderPos], 0);
+                blinkLed(5);
               }
             }
             else
             {
               playTrack(playOrder[orderPos], 0);
+              blinkLed(5);
             }
           }
           else if (volIndex > 0)
           {
             volIndex--;
             audioOut.SetGain(volSteps[volIndex]);
+            blinkLed(2);
             LOG("🔉 Vol: %.2f\n", volSteps[volIndex]);
           }
         }
@@ -565,15 +586,18 @@ void loop()
           {
             orderPos -= 2;
             nextTrack();
+            blinkLed(5);
           }
           else
           {
             playTrack(playOrder[orderPos], 0);
+            blinkLed(5);
           }
         }
         else
         {
           playTrack(playOrder[orderPos], 0);
+          blinkLed(5);
         }
         dnActionTriggered = true;
       }
