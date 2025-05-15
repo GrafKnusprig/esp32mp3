@@ -75,6 +75,14 @@ int current = -1;
 bool isPlaying = false;
 unsigned long lastBookmarkMs = 0;
 
+// Play mode enum and state
+enum PlayMode {
+  MODE_ALL,
+  MODE_FOLDER
+};
+PlayMode currentMode = MODE_ALL;
+String currentFolder = "";
+
 // define your fixed steps
 const float volSteps[] = {
     0.02f, 0.03f, 0.04f, 0.05f,
@@ -97,6 +105,8 @@ void updateShuffleFile()
   File shuffleFile = SD.open("/shuffle.txt", FILE_WRITE);
   if (shuffleFile)
   {
+    shuffleFile.printf("mode:%d\n", currentMode);
+    shuffleFile.printf("folder:%s\n", currentFolder.c_str());
     shuffleFile.printf("orderPos:%d\n", orderPos);
     for (int idx : playOrder)
     {
@@ -143,24 +153,34 @@ void blinkLed(int times)
       "blinkTask", 1024, new int(times), 1, &blinkTaskHandle);
 }
 
-void shuffleOrder(int excludeIdx = -1)
+void shuffleOrder(int currentIdx = -1)
 {
   playOrder.clear();
-  for (int i = 0; i < (int)tracks.size(); i++)
-  {
-    if (i != excludeIdx)
-      playOrder.push_back(i);
+  if (currentIdx >= 0) {
+    playOrder.push_back(currentIdx);
   }
-  // Fisher–Yates
-  for (int i = playOrder.size() - 1; i > 0; i--)
-  {
-    int j = esp_random() % (i + 1);
+
+  for (int i = 0; i < (int)tracks.size(); i++) {
+    if (i != currentIdx) {
+      if (currentMode == MODE_FOLDER) {
+        if (tracks[i].startsWith(currentFolder)) {
+          playOrder.push_back(i);
+        }
+      } else {
+        playOrder.push_back(i);
+      }
+    }
+  }
+
+  // Shuffle only the tail of the list (after current track)
+  for (int i = playOrder.size() - 1; i > (currentIdx >= 0 ? 0 : -1); i--) {
+    int j = esp_random() % (i + 1 - (currentIdx >= 0 ? 1 : 0)) + (currentIdx >= 0 ? 1 : 0);
     std::swap(playOrder[i], playOrder[j]);
   }
-  orderPos = 0;
 
+  orderPos = 0;
   updateShuffleFile();
-  LOG("✅ Shuffle list generated with %d tracks\n", (int)playOrder.size());
+  LOG("✅ Shuffle list generated (%s mode) with current track at pos 0\n", currentMode == MODE_FOLDER ? "folder" : "all");
 }
 
 void validateShuffleList()
@@ -174,53 +194,78 @@ void validateShuffleList()
 
 void loadShuffleFile(int excludeIdx = -1)
 {
-  if (!SD.exists("/shuffle.txt"))
-  {
+  if (!SD.exists("/shuffle.txt")) {
     LOG("❌ shuffle.txt not found\n");
     return;
   }
 
   File shuffleFile = SD.open("/shuffle.txt", FILE_READ);
-  if (!shuffleFile)
-  {
+  if (!shuffleFile) {
     LOG("❌ Failed to open shuffle.txt\n");
     return;
   }
 
   playOrder.clear();
-  String firstLine = shuffleFile.readStringUntil('\n');
-  if (firstLine.startsWith("orderPos:"))
-  {
-    orderPos = firstLine.substring(9).toInt();
-  }
-  else
-  {
-    LOG("❌ Invalid shuffle.txt format\n");
-    shuffleFile.close();
-    shuffleOrder(excludeIdx);
-    return;
-  }
+  String modeLine = shuffleFile.readStringUntil('\n');
+  String folderLine = shuffleFile.readStringUntil('\n');
+  String posLine = shuffleFile.readStringUntil('\n');
 
-  while (shuffleFile.available())
-  {
+  if (modeLine.startsWith("mode:"))
+    currentMode = (PlayMode)modeLine.substring(5).toInt();
+  if (folderLine.startsWith("folder:"))
+    currentFolder = folderLine.substring(7);
+  if (posLine.startsWith("orderPos:"))
+    orderPos = posLine.substring(9).toInt();
+
+  while (shuffleFile.available()) {
     int idx = shuffleFile.readStringUntil('\n').toInt();
     if (idx >= 0 && idx < (int)tracks.size())
-    {
       playOrder.push_back(idx);
-    }
   }
   shuffleFile.close();
 
-  if (playOrder.empty())
-  {
+  if (playOrder.empty()) {
     LOG("❌ shuffle.txt is empty or invalid\n");
-    shuffleOrder(excludeIdx);
-  }
-  else
-  {
+    shuffleOrder();
+  } else {
     validateShuffleList();
-    LOG("✅ Loaded shuffle.txt with %d tracks, starting at position %d\n", (int)playOrder.size(), orderPos);
+    LOG("✅ Loaded shuffle.txt with %d tracks, mode %d, folder %s\n", (int)playOrder.size(), currentMode, currentFolder.c_str());
   }
+}
+
+// Helper to extract folder of a track
+String getFolderOfTrack(const String &trackPath) {
+  int lastSlash = trackPath.lastIndexOf('/');
+  return (lastSlash > 0) ? trackPath.substring(0, lastSlash) : "/";
+}
+
+// Helper to get all folders
+std::vector<String> getAllFolders() {
+  std::vector<String> folders;
+  for (const String& t : tracks) {
+    String folder = getFolderOfTrack(t);
+    if (std::find(folders.begin(), folders.end(), folder) == folders.end()) {
+      folders.push_back(folder);
+    }
+  }
+  std::sort(folders.begin(), folders.end());
+  return folders;
+}
+
+// Forward declaration for playTrack to avoid compiler error
+void playTrack(int idx, uint32_t off);
+
+// Helper to switch to next folder and start playback
+void switchToNextFolder() {
+  std::vector<String> folders = getAllFolders();
+  auto it = std::find(folders.begin(), folders.end(), currentFolder);
+  if (it != folders.end() && ++it != folders.end()) {
+    currentFolder = *it;
+  } else {
+    currentFolder = folders.front();
+  }
+  shuffleOrder();
+  playTrack(playOrder[orderPos], 0);
 }
 
 void loadTracksRecursive(File dir, String path = "")
@@ -640,31 +685,39 @@ void loop()
   }
 
   if (bothHeld && upReading == HIGH && dnReading == HIGH) {
-      bothHeld = false;
-      unsigned long heldTime = now - sharedDownTime;
+    bothHeld = false;
+    unsigned long heldTime = now - sharedDownTime;
 
-      if (!bothActionTriggered) {
-          if (heldTime > 1500) {
-              LOG("🤜🤛 Long press BOTH buttons\n");
-              blinkLed(6);
-          } else {
-              LOG("🤜🤛 Short press BOTH buttons\n");
-              blinkLed(3);
-          }
+    if (!bothActionTriggered) {
+      if (heldTime > 1500) {
+        if (currentMode == MODE_ALL) {
+          currentFolder = getFolderOfTrack(tracks[current]);
+          currentMode = MODE_FOLDER;
+          shuffleOrder(current);
+          LOG("📁 Entered folder shuffle: %s\n", currentFolder.c_str());
+        } else {
+          currentMode = MODE_ALL;
+          currentFolder = "";
+          shuffleOrder(current);
+          LOG("🔀 Back to full shuffle mode\n");
+        }
+        updateShuffleFile();
+      } else if (currentMode == MODE_FOLDER) {
+        switchToNextFolder();
+        LOG("⏭️  Switched to next folder: %s\n", currentFolder.c_str());
       }
+    }
 
-      bothActionTriggered = false;
-      upHeld = upReading;
-      dnHeld = dnReading;
-  }
-
-  if (bothHeld && !bothActionTriggered) {
-      unsigned long heldTime = now - sharedDownTime;
-      if (heldTime > 3000) {
-          LOG("🤜🤛 Long press BOTH buttons (auto trigger)\n");
-          blinkLed(6);
-          bothActionTriggered = true;
-      }
+    bothActionTriggered = false;
+    upHeld = upReading;
+    dnHeld = dnReading;
   }
   lastDnState = dnReading;
+
+  // 3-second LED blink in folder mode
+  static unsigned long lastFolderBlink = 0;
+  if (currentMode == MODE_FOLDER && now - lastFolderBlink > 3000) {
+      blinkLed(1);
+      lastFolderBlink = now;
+  }
 }
