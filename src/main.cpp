@@ -434,6 +434,9 @@ void setup()
 void loop()
 {
   unsigned long now = millis();
+  static bool bothHeld = false;
+  static unsigned long sharedDownTime = 0;
+  static bool bothActionTriggered = false;
   static unsigned long lastPrevPressTime = 0;
   if (isPlaying)
   {
@@ -494,43 +497,45 @@ void loop()
   }
   if ((now - lastUpDebounceTime) > debounceDelay)
   {
-    if (upReading != upHeld)
-    {
-      upHeld = upReading;
-      if (upHeld == LOW)
+    if (!(upHeld == LOW && dnHeld == LOW)) {
+      if (upReading != upHeld)
       {
-        downTimeUp = now;
-        upActionTriggered = false;
-      }
-      else
-      {
-        if (!upActionTriggered)
+        upHeld = upReading;
+        if (upHeld == LOW)
         {
-          unsigned long heldTime = now - downTimeUp;
-          if (heldTime > 1500)
+          downTimeUp = now;
+          upActionTriggered = false;
+        }
+        else
+        {
+          if (!upActionTriggered)
           {
-            nextTrack();
-            blinkLed(5);
-          }
-          else if (volIndex < VOL_COUNT - 1)
-          {
-            volIndex++;
-            audioOut.SetGain(volSteps[volIndex]);
-            blinkLed(2);
-            LOG("🔊 Vol: %.2f\n", volSteps[volIndex]);
+            unsigned long heldTime = now - downTimeUp;
+            if (heldTime > 1500)
+            {
+              nextTrack();
+              blinkLed(5);
+            }
+            else if (volIndex < VOL_COUNT - 1)
+            {
+              volIndex++;
+              audioOut.SetGain(volSteps[volIndex]);
+              blinkLed(2);
+              LOG("🔊 Vol: %.2f\n", volSteps[volIndex]);
+            }
           }
         }
       }
-    }
 
-    if (upHeld == LOW && !upActionTriggered)
-    {
-      unsigned long heldTime = now - downTimeUp;
-      if (heldTime > 1500)
+      if (upHeld == LOW && !upActionTriggered)
       {
-        nextTrack();
-        blinkLed(5);
-        upActionTriggered = true;
+        unsigned long heldTime = now - downTimeUp;
+        if (heldTime > 1500)
+        {
+          nextTrack();
+          blinkLed(5);
+          upActionTriggered = true;
+        }
       }
     }
   }
@@ -544,31 +549,38 @@ void loop()
   }
   if ((now - lastDnDebounceTime) > debounceDelay)
   {
-    if (dnReading != dnHeld)
-    {
-      dnHeld = dnReading;
-      if (dnHeld == LOW)
+    if (!(upHeld == LOW && dnHeld == LOW)) {
+      if (dnReading != dnHeld)
       {
-        downTimeDn = now;
-        dnActionTriggered = false;
-      }
-      else
-      {
-        if (!dnActionTriggered)
+        dnHeld = dnReading;
+        if (dnHeld == LOW)
         {
-          unsigned long heldTime = now - downTimeDn;
-          if (heldTime > 1500)
+          downTimeDn = now;
+          dnActionTriggered = false;
+        }
+        else
+        {
+          if (!dnActionTriggered)
           {
-            unsigned long timeSinceLast = now - lastPrevPressTime;
-            lastPrevPressTime = now;
-
-            if (timeSinceLast < 10000)
+            unsigned long heldTime = now - downTimeDn;
+            if (heldTime > 1500)
             {
-              if (orderPos > 0)
+              unsigned long timeSinceLast = now - lastPrevPressTime;
+              lastPrevPressTime = now;
+
+              if (timeSinceLast < 10000)
               {
-                orderPos -= 2;
-                nextTrack();
-                blinkLed(5);
+                if (orderPos > 0)
+                {
+                  orderPos -= 2;
+                  nextTrack();
+                  blinkLed(5);
+                }
+                else
+                {
+                  playTrack(playOrder[orderPos], 0);
+                  blinkLed(5);
+                }
               }
               else
               {
@@ -576,53 +588,83 @@ void loop()
                 blinkLed(5);
               }
             }
+            else if (volIndex > 0)
+            {
+              volIndex--;
+              audioOut.SetGain(volSteps[volIndex]);
+              blinkLed(2);
+              LOG("🔉 Vol: %.2f\n", volSteps[volIndex]);
+            }
+          }
+        }
+      }
+
+      if (dnHeld == LOW && !dnActionTriggered)
+      {
+        unsigned long heldTime = now - downTimeDn;
+        if (heldTime > 1500)
+        {
+          unsigned long timeSinceLast = now - lastPrevPressTime;
+          lastPrevPressTime = now;
+
+          if (timeSinceLast < 10000)
+          {
+            if (orderPos > 0)
+            {
+              orderPos -= 2;
+              nextTrack();
+              blinkLed(5);
+            }
             else
             {
               playTrack(playOrder[orderPos], 0);
               blinkLed(5);
             }
           }
-          else if (volIndex > 0)
-          {
-            volIndex--;
-            audioOut.SetGain(volSteps[volIndex]);
-            blinkLed(2);
-            LOG("🔉 Vol: %.2f\n", volSteps[volIndex]);
-          }
-        }
-      }
-    }
-
-    if (dnHeld == LOW && !dnActionTriggered)
-    {
-      unsigned long heldTime = now - downTimeDn;
-      if (heldTime > 1500)
-      {
-        unsigned long timeSinceLast = now - lastPrevPressTime;
-        lastPrevPressTime = now;
-
-        if (timeSinceLast < 10000)
-        {
-          if (orderPos > 0)
-          {
-            orderPos -= 2;
-            nextTrack();
-            blinkLed(5);
-          }
           else
           {
             playTrack(playOrder[orderPos], 0);
             blinkLed(5);
           }
+          dnActionTriggered = true;
         }
-        else
-        {
-          playTrack(playOrder[orderPos], 0);
-          blinkLed(5);
-        }
-        dnActionTriggered = true;
       }
     }
+  }
+
+  // Check for simultaneous button press (after individual handling)
+  if (upHeld == LOW && dnHeld == LOW && !bothHeld) {
+      bothHeld = true;
+      sharedDownTime = now;
+      bothActionTriggered = false;
+  }
+
+  if (bothHeld && upReading == HIGH && dnReading == HIGH) {
+      bothHeld = false;
+      unsigned long heldTime = now - sharedDownTime;
+
+      if (!bothActionTriggered) {
+          if (heldTime > 1500) {
+              LOG("🤜🤛 Long press BOTH buttons\n");
+              blinkLed(6);
+          } else {
+              LOG("🤜🤛 Short press BOTH buttons\n");
+              blinkLed(3);
+          }
+      }
+
+      bothActionTriggered = false;
+      upHeld = upReading;
+      dnHeld = dnReading;
+  }
+
+  if (bothHeld && !bothActionTriggered) {
+      unsigned long heldTime = now - sharedDownTime;
+      if (heldTime > 3000) {
+          LOG("🤜🤛 Long press BOTH buttons (auto trigger)\n");
+          blinkLed(6);
+          bothActionTriggered = true;
+      }
   }
   lastDnState = dnReading;
 }
