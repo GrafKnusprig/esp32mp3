@@ -42,7 +42,7 @@ SemaphoreHandle_t sdMutex;
 // │        GPIO27────────────────▶│ BTN_VOL_DN  │
 // └──────────────┘                └─────────────┘
 
-#define SERIAL_OUTPUT 1
+#define SERIAL_OUTPUT 0
 
 #if SERIAL_OUTPUT
 #define LOG(...) Serial.printf(__VA_ARGS__)
@@ -124,11 +124,9 @@ enum AudioType
     TYPE_UNKNOWN
 };
 AudioType currentType = TYPE_UNKNOWN;
-// std::vector<String> tracks;
-// std::vector<int> playOrder;
-// int orderPos = 0;
 int totalFiles = -1;
 int currentIdx = -1;
+int currentFolderIdx = -1;
 bool isPlaying = false;
 unsigned long lastBookmarkMs = 0;
 volatile bool _lockShuffle = false;
@@ -144,10 +142,8 @@ enum PlayMode
     MODE_FOLDER
 };
 PlayMode currentMode = MODE_ALL;
-int currentFolderIndex = -1;
-std::vector<String> allFolders;
 
-// define your fixed steps
+// fixed volume steps
 const float volSteps[] = {
     0.02f, 0.03f, 0.04f, 0.05f,
     0.10f, 0.15f, 0.20f, 0.25f,
@@ -155,7 +151,6 @@ const float volSteps[] = {
     0.70f, 0.80f, 0.90f, 1.00f};
 const int VOL_COUNT = sizeof(volSteps) / sizeof(volSteps[0]);
 
-// track which step you’re on
 int volIndex = 7; // start at 0.05 (index 3)
 
 bool lastUpState = HIGH, lastDnState = HIGH;
@@ -164,21 +159,9 @@ bool upHeld = false, dnHeld = false;
 QueueHandle_t bookmarkQueue;
 File bookmarkFile;
 
-inline void lockShuffle() { _lockShuffle = true; }
-inline void unlockShuffle() { _lockShuffle = false; }
-inline bool shuffleLocked() { return _lockShuffle; }
-
 inline void lockButtons() { _lockButtons = true; }
 inline void unlockButtons() { _lockButtons = false; }
 inline bool buttonsLocked() { return _lockButtons; }
-
-inline void lockPlay() { _lockPlay = true; }
-inline void unlockPlay() { _lockPlay = false; }
-inline bool playLocked() { return _lockPlay; }
-
-inline void lockBookmark() { _lockBookmark = true; }
-inline void unlockBookmark() { _lockBookmark = false; }
-inline bool bookmarkLocked() { return _lockBookmark; }
 
 bool writeIndexFile()
 {
@@ -191,7 +174,6 @@ bool writeIndexFile()
         return true;
     }
 
-    // Open the index file for writing
     File indexFile = SD.open("/index", FILE_WRITE);
     if (!indexFile)
     {
@@ -360,49 +342,6 @@ bool writeIndexFile()
     return true;
 }
 
-// void rewriteShuffleFile()
-// {
-//     if (shuffleLocked())
-//     {
-//         LOGLN("Skipped shuffle file update: busy");
-//         return;
-//     }
-
-//     lockShuffle();
-//     lockButtons();
-//     lockPlay();
-//     xSemaphoreTake(sdMutex, portMAX_DELAY);
-
-//     if (SD.exists("/shuffle.txt"))
-//     {
-//         SD.remove("/shuffle.txt");
-//         LOGLN("Shuffle file deleted");
-//     }
-
-//     File shuffleFile = SD.open("/shuffle.txt", FILE_WRITE);
-//     if (shuffleFile)
-//     {
-//         shuffleFile.printf("mode:%d\n", currentMode);
-//         shuffleFile.printf("folderIndex:%d\n", currentFolderIndex);
-//         shuffleFile.printf("orderPos:%d\n", orderPos);
-//         for (int idx : playOrder)
-//         {
-//             shuffleFile.printf("%d\n", idx);
-//         }
-//         shuffleFile.close();
-//         LOGLN("Shuffle file written");
-//     }
-//     else
-//     {
-//         LOGLN("Failed to update shuffle file");
-//     }
-//     xSemaphoreGive(sdMutex);
-//     unlockPlay();
-//     unlockButtons();
-//     unlockShuffle();
-// }
-
-// Move blinkTaskHandle to global scope
 TaskHandle_t blinkTaskHandle = NULL;
 void blinkLed(int times)
 {
@@ -436,166 +375,165 @@ void blinkLed(int times)
         "blinkTask", 1024, blinkCount, 1, &blinkTaskHandle);
 }
 
-// void shuffleOrder()
-// {
-//     xQueueReset(bookmarkQueue); // 🧼 flush pending bookmarks before switching folder
-
-//     bool hasIndex = current >= 0 && current < (int)tracks.size();
-
-//     if (shuffleLocked())
-//     {
-//         LOGLN("Skipped shuffling: busy");
-//         return;
-//     }
-
-//     lockShuffle();
-//     lockPlay();
-//     lockButtons();
-
-//     playOrder.clear();
-//     for (int i = 0; i < (int)tracks.size(); i++)
-//     {
-//         if (hasIndex && i == current)
-//             continue;
-
-//         if (currentMode == MODE_FOLDER && currentFolderIndex >= 0 && currentFolderIndex < (int)allFolders.size())
-//         {
-//             if (tracks[i].startsWith(allFolders[currentFolderIndex]))
-//             {
-//                 playOrder.push_back(i);
-//             }
-//         }
-//         else
-//         {
-//             playOrder.push_back(i);
-//         }
-//     }
-//     std::vector<int> _playorder = playOrder;
-
-//     // Fisher-Yates shuffle
-//     for (int i = _playorder.size() - 1; i > 0; i--)
-//     {
-//         int j = esp_random() % (i + 1);
-//         std::swap(_playorder[i], _playorder[j]);
-//     }
-
-//     if (hasIndex)
-//     {
-//         playOrder.clear();
-//         playOrder = _playorder;
-//         playOrder.push_back(current);
-//     }
-//     else
-//     {
-//         playOrder = _playorder;
-//     }
-
-//     orderPos = 0;
-//     unlockButtons();
-//     unlockPlay();
-//     unlockShuffle();
-
-//     rewriteShuffleFile();
-
-//     LOG("Shuffle list generated (Mode: %s) with current track at pos 0\n", currentMode == MODE_FOLDER ? "folder" : "all");
-// }
-
-// void validateShuffleList()
-// {
-//     int expectedSize = 0;
-//     if (currentMode == MODE_FOLDER && currentFolderIndex >= 0 && currentFolderIndex < (int)allFolders.size())
-//     {
-//         for (const auto &track : tracks)
-//         {
-//             if (track.startsWith(allFolders[currentFolderIndex]))
-//                 expectedSize++;
-//         }
-//     }
-//     else
-//     {
-//         expectedSize = tracks.size();
-//     }
-
-//     if ((int)playOrder.size() != expectedSize)
-//     {
-//         LOGLN("Shuffle list size mismatch. Regenerating shuffle list...");
-//         shuffleOrder();
-//     }
-// }
-
-// void loadShuffleFile()
-// {
-//     if (!SD.exists("/shuffle.txt"))
-//     {
-//         LOGLN("shuffle.txt not found");
-//         return;
-//     }
-
-//     File shuffleFile = SD.open("/shuffle.txt", FILE_READ);
-//     if (!shuffleFile)
-//     {
-//         LOGLN("Failed to open shuffle.txt");
-//         return;
-//     }
-
-//     lockShuffle();
-//     lockPlay();
-//     lockButtons();
-
-//     playOrder.clear();
-//     String modeLine = shuffleFile.readStringUntil('\n');
-//     String folderLine = shuffleFile.readStringUntil('\n');
-//     String posLine = shuffleFile.readStringUntil('\n');
-
-//     if (modeLine.startsWith("mode:"))
-//         currentMode = (PlayMode)modeLine.substring(5).toInt();
-//     if (folderLine.startsWith("folderIndex:"))
-//         currentFolderIndex = folderLine.substring(12).toInt();
-//     if (posLine.startsWith("orderPos:"))
-//         orderPos = posLine.substring(9).toInt();
-
-//     while (shuffleFile.available())
-//     {
-//         int idx = shuffleFile.readStringUntil('\n').toInt();
-//         if (idx >= 0 && idx < (int)tracks.size())
-//             playOrder.push_back(idx);
-//     }
-//     shuffleFile.close();
-
-//     unlockButtons();
-//     unlockPlay();
-//     unlockShuffle();
-
-//     validateShuffleList();
-//     LOG("Loaded shuffle.txt with %d tracks, mode %d, folderIndex %d\n", (int)playOrder.size(), currentMode, currentFolderIndex);
-// }
-
-// // Helper to extract folder of a track
-// String getFolderOfTrack(const String &trackPath)
-// {
-//     int lastSlash = trackPath.lastIndexOf('/');
-//     return (lastSlash > 0) ? trackPath.substring(0, lastSlash) : "/";
-// }
-
-void playTrack(int idx, uint32_t off)
+// Helper to read folder counts from /folderindex
+std::vector<int> getFolderCounts()
 {
-    if (playLocked())
+    std::vector<int> folderCounts;
+    File folderIdxFile = SD.open("/folderindex", FILE_READ);
+    if (!folderIdxFile)
+        return folderCounts;
+    String line = folderIdxFile.readStringUntil('\n');
+    folderIdxFile.close();
+    int start = 0;
+    while (start < line.length())
     {
-        LOGLN("Skipped playTrack: busy");
+        int end = line.indexOf(' ', start);
+        if (end == -1)
+            end = line.length();
+        String numStr = line.substring(start, end);
+        int val = numStr.toInt();
+        if (val > 0)
+            folderCounts.push_back(val);
+        start = end + 1;
+    }
+    return folderCounts;
+}
+
+// Helper to get folder start/end indices
+void getFolderStartEnd(const std::vector<int> &folderCounts, int folderIdx, int &startIdx, int &endIdx)
+{
+    startIdx = 0;
+    for (int i = 0; i < folderIdx; ++i)
+        startIdx += folderCounts[i];
+    endIdx = startIdx + folderCounts[folderIdx] - 1;
+}
+
+void switchToFolderMode()
+{
+    LOGLN("Switching to folder mode");
+    xSemaphoreTake(sdMutex, portMAX_DELAY);
+
+    // 1. Find the folder of the current track by reading the index file at currentIdx
+    String currentTrackPath;
+    File indexFile = SD.open("/index", FILE_READ);
+    if (indexFile)
+    {
+        for (int i = 0; i <= currentIdx; ++i)
+        {
+            currentTrackPath = indexFile.readStringUntil('\n');
+        }
+        indexFile.close();
+        currentTrackPath.trim();
+    }
+    else
+    {
+        LOGLN("Failed to open /index for folder mode");
+        xSemaphoreGive(sdMutex);
         return;
     }
 
-    // Debug: log entry to playTrack()
+    LOG("Current track path: %s\n", currentTrackPath.c_str());
+
+    // Extract folder from currentTrackPath
+    int lastSlash = currentTrackPath.lastIndexOf('/');
+    String currentFolder = (lastSlash > 0) ? currentTrackPath.substring(0, lastSlash) : "/";
+
+    // 2. Find the folder index by scanning /index for folder boundaries
+    int folderIdx = -1;
+    String lastFolder = "";
+    File idxFile = SD.open("/index", FILE_READ);
+    if (idxFile)
+    {
+        while (idxFile.available())
+        {
+            String line = idxFile.readStringUntil('\n');
+            int slash = line.lastIndexOf('/');
+            String folder = (slash > 0) ? line.substring(0, slash) : "/";
+            if (line == currentTrackPath)
+            {
+                break;
+            }
+            if (folder != lastFolder)
+            {
+                folderIdx++;
+                lastFolder = folder;
+            }
+        }
+        idxFile.close();
+    }
+    else
+    {
+        LOGLN("Failed to open /index for folder scan");
+        xSemaphoreGive(sdMutex);
+        return;
+    }
+
+    // Save the folderIdx in currentFolderIdx
+    currentFolderIdx = folderIdx;
+
+    LOG("Current folder: %s (index %d)\n", currentFolder.c_str(), folderIdx);
+
+    // 3. Read folder counts from /folderindex
+    File folderIdxFile = SD.open("/folderindex", FILE_READ);
+    if (!folderIdxFile)
+    {
+        LOGLN("Failed to open /folderindex");
+        xSemaphoreGive(sdMutex);
+        return;
+    }
+    String line = folderIdxFile.readStringUntil('\n');
+    folderIdxFile.close();
+
+    // Parse folder counts
+    std::vector<int> folderCounts;
+    int start = 0;
+    while (start < line.length())
+    {
+        int end = line.indexOf(' ', start);
+        if (end == -1)
+            end = line.length();
+        String numStr = line.substring(start, end);
+        int val = numStr.toInt();
+        if (val > 0)
+            folderCounts.push_back(val);
+        start = end + 1;
+    }
+
+    // 4. Calculate start and end index for shuffler
+    int startIdx = 0;
+    for (int i = 0; i < folderIdx; ++i)
+        startIdx += folderCounts[i];
+    int endIdx = startIdx + folderCounts[folderIdx] - 1;
+
+    // 5. Set mode and shuffler, play track
+    currentMode = MODE_FOLDER;
+    shuffler.~LazyShuffler();
+    new (&shuffler) LazyShuffler(startIdx, endIdx);
+
+    LOG("Folder %d: startIdx=%d, endIdx=%d\n", folderIdx, startIdx, endIdx);
+
+    xSemaphoreGive(sdMutex);
+    LOG("Mutex given\n");
+}
+
+void switchToAllMode()
+{
+    LOGLN("Switching to all mode");
+    currentMode = MODE_ALL;
+    currentFolderIdx = -1;
+    shuffler.~LazyShuffler();
+    new (&shuffler) LazyShuffler(0, totalFiles - 1);
+}
+
+void playTrack(int idx, uint32_t off)
+{
     LOG("playTrack() called with idx=%d\n", idx);
-    // LOG("Checking idx = %d against tracks.size() = %d\n", idx, (int)tracks.size());
 
     if (idx < 0 || idx >= totalFiles)
     {
         LOG("Invalid track index: %d\n", idx);
         return;
     }
-
-    xQueueReset(bookmarkQueue);
 
     if (mp3.isRunning())
         mp3.stop();
@@ -604,13 +542,17 @@ void playTrack(int idx, uint32_t off)
     if (flac.isRunning())
         flac.stop();
     fileSrc.close();
-    
+
+    LOG("Stopping previous track\n");
+
     isPlaying = false;
 
     currentIdx = idx;
 
     String currentPath;
     // Read the path from the index file at line number idx
+
+    LOG("waiting for sdMutex...\n");
     xSemaphoreTake(sdMutex, portMAX_DELAY);
     File indexFile = SD.open("/index", FILE_READ);
     if (indexFile)
@@ -621,6 +563,7 @@ void playTrack(int idx, uint32_t off)
         }
         indexFile.close();
         currentPath.trim();
+        xSemaphoreGive(sdMutex);
     }
     else
     {
@@ -628,9 +571,7 @@ void playTrack(int idx, uint32_t off)
         xSemaphoreGive(sdMutex);
         return;
     }
-    xSemaphoreGive(sdMutex);
 
-    // Debug: log track path
     LOG("Track path: %s\n", currentPath.c_str());
     LOG("Track %u: %s  (seek %u bytes)\n", idx, currentPath.c_str(), off);
 
@@ -675,26 +616,42 @@ void playTrack(int idx, uint32_t off)
 
 void switchToNextFolder()
 {
-    return;
-    // xQueueReset(bookmarkQueue); // 🧼 flush pending bookmarks before switching folder
-    // if (allFolders.empty())
-    //     return;
-    // currentFolderIndex = (currentFolderIndex + 1) % allFolders.size();
-    // current = -1; // Reset current track
-    // shuffleOrder();
-    // LOG("Switched to next folder: %s\n", allFolders[currentFolderIndex].c_str());
-    // playTrack(playOrder[orderPos], 0);
+    xSemaphoreTake(sdMutex, portMAX_DELAY);
+
+    std::vector<int> folderCounts = getFolderCounts();
+    if (folderCounts.empty())
+    {
+        LOGLN("No folder counts found");
+        xSemaphoreGive(sdMutex);
+        return;
+    }
+
+    int totalFolders = folderCounts.size();
+    LOG("Total folders: %d\n", totalFolders);
+    int nextFolderIdx = currentFolderIdx + 1;
+    LOG("Current folder index: %d\n", currentFolderIdx);
+
+    if (nextFolderIdx >= totalFolders)
+        nextFolderIdx = 0;
+
+    // Find the start index of the next folder in /index
+    int startIdx = 0, endIdx = 0;
+    getFolderStartEnd(folderCounts, nextFolderIdx, startIdx, endIdx);
+
+    // Set mode, update shuffler, and play first track in next folder
+    currentMode = MODE_FOLDER;
+    currentFolderIdx = nextFolderIdx;
+    shuffler.~LazyShuffler();
+    new (&shuffler) LazyShuffler(startIdx, endIdx);
+    LOG("Switching to folder %d (startIdx=%d, endIdx=%d)\n", nextFolderIdx, startIdx, endIdx);
+
+    xSemaphoreGive(sdMutex);
+
+    playTrack(shuffler.next(), 0);
 }
 
 void bookmarkTask(void *pv)
 {
-    if (bookmarkLocked())
-    {
-        LOGLN("Skipped bookmarkTask: busy");
-        vTaskDelete(NULL);
-        return;
-    }
-
     uint32_t pos;
     for (;;)
     {
@@ -705,23 +662,24 @@ void bookmarkTask(void *pv)
 
             xSemaphoreTake(sdMutex, portMAX_DELAY);
             bookmarkFile.seek(0);
-            bookmarkFile.printf("%d %u\n", currentIdx, pos);
+            // Save: currentIdx, pos, currentMode, currentFolderIdx
+            bookmarkFile.printf("%d %u %d %d\n", currentIdx, pos, (int)currentMode, currentFolderIdx);
             bookmarkFile.flush();
             xSemaphoreGive(sdMutex);
         }
     }
 }
 
-bool readBookmark(int &idx, uint32_t &off)
+bool readBookmark(int &idx, uint32_t &off, int &mode, int &foIdx)
 {
     xSemaphoreTake(sdMutex, portMAX_DELAY);
-    if (!SD.exists("/bookmark.txt"))
+    if (!SD.exists("/bookmark"))
     {
         xSemaphoreGive(sdMutex);
         return false;
     }
 
-    File f = SD.open("/bookmark.txt", FILE_READ);
+    File f = SD.open("/bookmark", FILE_READ);
     if (!f)
     {
         xSemaphoreGive(sdMutex);
@@ -732,17 +690,17 @@ bool readBookmark(int &idx, uint32_t &off)
     f.close();
     xSemaphoreGive(sdMutex);
 
-    int read = sscanf(line.c_str(), "%d %u", &idx, &off);
-    return (read == 2 && idx >= 0 && idx < totalFiles);
+    int read = sscanf(line.c_str(), "%d %u %d %d", &idx, &off, &mode, &foIdx);
+
+    return (read >= 2 && idx >= 0 && idx < totalFiles);
 }
 
 void nextTrack()
 {
     LOGLN("nextTrack() called");
-    xQueueReset(bookmarkQueue); // 🧼 flush pending bookmarks before switching folder
+    xQueueReset(bookmarkQueue);
 
     LOGLN("Bookmark file flushed, waiting for lock...");
-    lockBookmark();
 
     int next = shuffler.next();
     if (currentIdx == next)
@@ -750,7 +708,6 @@ void nextTrack()
         next = shuffler.next();
     }
 
-    unlockBookmark();
     playTrack(next, 0);
 }
 
@@ -760,19 +717,16 @@ void previousTrack()
     xQueueReset(bookmarkQueue);
 
     LOGLN("Bookmark file flushed, waiting for lock...");
-    lockBookmark();
 
     int last = shuffler.last();
     if (last < 0)
     {
         // Optionally, replay current track or do nothing
         LOGLN("No previous track available");
-        unlockBookmark();
         // Optionally: playTrack(currentIdx, 0);
         return;
     }
 
-    unlockBookmark();
     playTrack(last, 0);
 }
 
@@ -849,27 +803,53 @@ void setup()
 
     int idx;
     uint32_t off;
-    bool bookmarkFound = readBookmark(idx, off);
+    int mode;
+    int foIdx;
+    bool bookmarkFound = readBookmark(idx, off, mode, foIdx);
     LOGLN(bookmarkFound ? "Bookmark file opened" : "No bookmark found");
-
-    bookmarkFile = SD.open("/bookmark.txt", FILE_WRITE);
-    if (!bookmarkFile)
-    {
-        LOGLN("Failed to open bookmark.txt for writing");
-    }
-
-    bookmarkQueue = xQueueCreate(5, sizeof(uint32_t));
-    xTaskCreatePinnedToCore(bookmarkTask, "bookmarkTask", 4096, NULL, 1, NULL, 0);
-
     if (bookmarkFound)
     {
+        currentMode = static_cast<PlayMode>(mode);
+        currentFolderIdx = foIdx;
         LOG("Resume track %d @ byte %u\n", idx, off);
-        playTrack(idx, off);
+
+        if (currentMode == MODE_FOLDER)
+        {
+            std::vector<int> folderCounts = getFolderCounts();
+            if (currentFolderIdx < 0 || currentFolderIdx >= folderCounts.size())
+            {
+                LOGLN("Invalid folder index in bookmark");
+                currentMode = MODE_ALL;
+                currentFolderIdx = -1;
+            }
+            else
+            {
+                int startIdx = 0, endIdx = 0;
+                getFolderStartEnd(folderCounts, currentFolderIdx, startIdx, endIdx);
+                shuffler.~LazyShuffler();
+                new (&shuffler) LazyShuffler(startIdx, endIdx);
+            }
+
+            playTrack(idx, off);
+        }
+        else
+        {
+            playTrack(idx, off);
+        }
     }
     else
     {
         playTrack(shuffler.next(), 0);
     }
+
+    bookmarkFile = SD.open("/bookmark", FILE_WRITE);
+    if (!bookmarkFile)
+    {
+        LOGLN("Failed to open bookmark for writing");
+    }
+
+    bookmarkQueue = xQueueCreate(5, sizeof(uint32_t));
+    xTaskCreatePinnedToCore(bookmarkTask, "bookmarkTask", 4096, NULL, 1, NULL, 0);
 
     // button setup
     pinMode(BTN_VOL_UP, INPUT_PULLUP);
@@ -918,25 +898,23 @@ void loop()
             LOGLN("loop() returned false — decoder done");
             isPlaying = false;
             uint32_t flushDummy = fileSrc.getPos();
-            xQueueSend(bookmarkQueue, &flushDummy, 0);
             delay(10);
             nextTrack();
             return;
         }
 
-        unsigned long now = millis();
-        uint32_t pos = 0;
-        if (fileSrc.isOpen())
-        {
-            pos = fileSrc.getPos();
-        }
-        else
-        {
-            LOGLN("fileSrc not open during bookmark getPos()");
-        }
-
         if (now - lastBookmarkMs > 5000)
         {
+            unsigned long now = millis();
+            uint32_t pos = 0;
+            if (fileSrc.isOpen())
+            {
+                pos = fileSrc.getPos();
+            }
+            else
+            {
+                LOGLN("fileSrc not open during bookmark getPos()");
+            }
             if (pos > 0)
             {
                 xQueueSend(bookmarkQueue, &pos, 0);
@@ -1103,11 +1081,11 @@ void loop()
                 {
                     if (currentMode == MODE_ALL)
                     {
-                        return;
+                        switchToFolderMode();
                     }
                     else
                     {
-                        return;
+                        switchToAllMode();
                     }
                 }
                 else if (currentMode == MODE_FOLDER)
