@@ -184,9 +184,9 @@ bool writeIndexFile()
 {
     xSemaphoreTake(sdMutex, portMAX_DELAY);
 
-    if (SD.exists("/index"))
+    if (SD.exists("/index") && SD.exists("/folderindex"))
     {
-        LOGLN("Index found");
+        LOGLN("Index and folderindex found");
         xSemaphoreGive(sdMutex);
         return true;
     }
@@ -584,15 +584,6 @@ void playTrack(int idx, uint32_t off)
         LOGLN("Skipped playTrack: busy");
         return;
     }
-    xQueueReset(bookmarkQueue);
-
-    if (mp3.isRunning())
-        mp3.stop();
-    if (wav.isRunning())
-        wav.stop();
-    if (flac.isRunning())
-        flac.stop();
-    fileSrc.close();
 
     // Debug: log entry to playTrack()
     LOG("playTrack() called with idx=%d\n", idx);
@@ -603,6 +594,18 @@ void playTrack(int idx, uint32_t off)
         LOG("Invalid track index: %d\n", idx);
         return;
     }
+
+    xQueueReset(bookmarkQueue);
+
+    if (mp3.isRunning())
+        mp3.stop();
+    if (wav.isRunning())
+        wav.stop();
+    if (flac.isRunning())
+        flac.stop();
+    fileSrc.close();
+    
+    isPlaying = false;
 
     currentIdx = idx;
 
@@ -754,7 +757,7 @@ void nextTrack()
 void previousTrack()
 {
     LOGLN("previousTrack() called");
-    xQueueReset(bookmarkQueue); // 🧼 flush pending bookmarks before switching folder
+    xQueueReset(bookmarkQueue);
 
     LOGLN("Bookmark file flushed, waiting for lock...");
     lockBookmark();
@@ -762,7 +765,11 @@ void previousTrack()
     int last = shuffler.last();
     if (last < 0)
     {
-        playTrack(currentIdx, 0);
+        // Optionally, replay current track or do nothing
+        LOGLN("No previous track available");
+        unlockBookmark();
+        // Optionally: playTrack(currentIdx, 0);
+        return;
     }
 
     unlockBookmark();
