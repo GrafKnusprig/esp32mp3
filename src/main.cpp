@@ -16,6 +16,7 @@ SemaphoreHandle_t sdMutex;
 #include <cstdio>
 #include <WiFi.h>
 #include <unordered_set>
+#include <Button.h>
 
 // ESP32 Dev Kit                   SD Card Module
 // ┌──────────────┐                ┌─────────────┐
@@ -42,7 +43,7 @@ SemaphoreHandle_t sdMutex;
 // │        GPIO27────────────────▶│ BTN_VOL_DN  │
 // └──────────────┘                └─────────────┘
 
-#define SERIAL_OUTPUT 0
+#define SERIAL_OUTPUT 1
 
 #if SERIAL_OUTPUT
 #define LOG(...) Serial.printf(__VA_ARGS__)
@@ -56,8 +57,8 @@ SemaphoreHandle_t sdMutex;
 #define I2S_BCLK 26
 #define I2S_LRC 25
 #define I2S_DOUT 22
-#define BTN_VOL_UP 33
-#define BTN_VOL_DN 27
+#define BTN_VOL_UP GPIO_NUM_33
+#define BTN_VOL_DN GPIO_NUM_27
 #define LED_PIN 2
 
 class LazyShuffler
@@ -66,7 +67,6 @@ public:
     LazyShuffler(int start, int end)
         : start(start), end(end), total(end - start + 1), remaining(total)
     {
-        round++;
     }
 
     int next()
@@ -76,7 +76,6 @@ public:
             remaining = total;
             used.clear();
             history.clear();
-            round++;
         }
 
         int val;
@@ -106,10 +105,7 @@ private:
     int start, end, total, remaining;
     std::unordered_set<int> used;
     std::vector<int> history;
-    static int round;
 };
-
-int LazyShuffler::round = 0;
 
 AudioFileSourceSD fileSrc;
 AudioGeneratorMP3 mp3;
@@ -126,22 +122,8 @@ enum AudioType
 AudioType currentType = TYPE_UNKNOWN;
 int totalFiles = -1;
 int currentIdx = -1;
-int currentFolderIdx = -1;
-bool isPlaying = false;
 unsigned long lastBookmarkMs = 0;
-volatile bool _lockShuffle = false;
-volatile bool _lockButtons = false;
-volatile bool _lockPlay = false;
-volatile bool _lockBookmark = false;
 LazyShuffler shuffler(0, 0);
-
-// Play mode enum and state
-enum PlayMode
-{
-    MODE_ALL,
-    MODE_FOLDER
-};
-PlayMode currentMode = MODE_ALL;
 
 // fixed volume steps
 const float volSteps[] = {
@@ -153,23 +135,16 @@ const int VOL_COUNT = sizeof(volSteps) / sizeof(volSteps[0]);
 
 int volIndex = 7; // start at 0.05 (index 3)
 
-bool lastUpState = HIGH, lastDnState = HIGH;
-bool upHeld = false, dnHeld = false;
-
 QueueHandle_t bookmarkQueue;
 File bookmarkFile;
-
-inline void lockButtons() { _lockButtons = true; }
-inline void unlockButtons() { _lockButtons = false; }
-inline bool buttonsLocked() { return _lockButtons; }
 
 bool writeIndexFile()
 {
     xSemaphoreTake(sdMutex, portMAX_DELAY);
 
-    if (SD.exists("/index") && SD.exists("/folderindex"))
+    if (SD.exists("/index"))
     {
-        LOGLN("Index and folderindex found");
+        LOGLN("Index found");
         xSemaphoreGive(sdMutex);
         return true;
     }
@@ -228,117 +203,10 @@ bool writeIndexFile()
         return false;
     }
 
-    // Step 1: Read all lines into a vector, sort, and write to a temp file
-    const int BATCH_SIZE = 128; // Tune for available RAM
-    std::vector<String> batch;
-    std::vector<String> tempFiles;
-    File inFile = SD.open("/index", FILE_READ);
-    int batchNum = 0;
-    while (inFile.available())
-    {
-        String line = inFile.readStringUntil('\n');
-        if (line.length() > 0)
-            batch.push_back(line);
-        if ((int)batch.size() >= BATCH_SIZE || !inFile.available())
-        {
-            std::sort(batch.begin(), batch.end());
-            String tempName = "/index_tmp" + String(batchNum++);
-            tempFiles.push_back(tempName);
-            File tmp = SD.open(tempName.c_str(), FILE_WRITE);
-            for (const auto &l : batch)
-                tmp.println(l);
-            tmp.close();
-            batch.clear();
-        }
-    }
-    inFile.close();
-    batch.clear(); // free memory
-
-    // Step 2: Merge temp files into the final sorted index
-    File outFile = SD.open("/index_sorted", FILE_WRITE);
-    std::vector<File> tmps;
-    std::vector<String> lines;
-    for (const auto &name : tempFiles)
-    {
-        File f = SD.open(name.c_str(), FILE_READ);
-        tmps.push_back(f);
-        lines.push_back(f.readStringUntil('\n'));
-    }
-
-    while (true)
-    {
-        int minIdx = -1;
-        String minStr;
-        for (size_t i = 0; i < lines.size(); ++i)
-        {
-            if (lines[i].length() == 0)
-                continue;
-            if (minIdx == -1 || lines[i] < minStr)
-            {
-                minIdx = i;
-                minStr = lines[i];
-            }
-        }
-        if (minIdx == -1)
-            break;
-        outFile.println(minStr);
-        if (tmps[minIdx].available())
-            lines[minIdx] = tmps[minIdx].readStringUntil('\n');
-        else
-            lines[minIdx] = "";
-    }
-    for (auto &f : tmps)
-        f.close();
-    outFile.close();
-    tmps.clear();
-    lines.clear();
-
-    // Remove temp files and original index
-    for (const auto &name : tempFiles)
-        SD.remove(name.c_str());
-    tempFiles.clear();
-    SD.remove("/index");
-
-    // Rename sorted index to /index
-    SD.rename("/index_sorted", "/index");
-
-    // Now, count files per folder and write the summary line
-    // We'll walk through the sorted index file line by line
-    File idx = SD.open("/index", FILE_READ);
-    std::vector<int> folderCounts;
-    String lastFolder = "";
-    int count = 0;
-    while (idx.available())
-    {
-        String line = idx.readStringUntil('\n');
-        int slash = line.lastIndexOf('/');
-        String folder = (slash > 0) ? line.substring(0, slash) : "/";
-        if (folder != lastFolder && lastFolder.length() > 0)
-        {
-            folderCounts.push_back(count);
-            count = 0;
-        }
-        count++;
-        lastFolder = folder;
-    }
-    if (count > 0)
-        folderCounts.push_back(count);
-    idx.close();
-
-    // Write the summary line to a separate file "folderindex"
-    File folderIdx = SD.open("/folderindex", FILE_WRITE);
-    for (size_t i = 0; i < folderCounts.size(); ++i)
-    {
-        folderIdx.print(folderCounts[i]);
-        if (i != folderCounts.size() - 1)
-            folderIdx.print(" ");
-    }
-    folderIdx.println();
-    folderIdx.close();
-    folderCounts.clear();
-
-    LOGLN("Index file created and sorted, folder counts written to /folderindex");
+    LOGLN("Index file created");
     xSemaphoreGive(sdMutex);
+    totalFiles = fileCount;
+    LOG("Total files: %d\n", totalFiles);
     return true;
 }
 
@@ -375,154 +243,15 @@ void blinkLed(int times)
         "blinkTask", 1024, blinkCount, 1, &blinkTaskHandle);
 }
 
-// Helper to read folder counts from /folderindex
-std::vector<int> getFolderCounts()
+void stopPlayback()
 {
-    std::vector<int> folderCounts;
-    File folderIdxFile = SD.open("/folderindex", FILE_READ);
-    if (!folderIdxFile)
-        return folderCounts;
-    String line = folderIdxFile.readStringUntil('\n');
-    folderIdxFile.close();
-    int start = 0;
-    while (start < line.length())
-    {
-        int end = line.indexOf(' ', start);
-        if (end == -1)
-            end = line.length();
-        String numStr = line.substring(start, end);
-        int val = numStr.toInt();
-        if (val > 0)
-            folderCounts.push_back(val);
-        start = end + 1;
-    }
-    return folderCounts;
-}
-
-// Helper to get folder start/end indices
-void getFolderStartEnd(const std::vector<int> &folderCounts, int folderIdx, int &startIdx, int &endIdx)
-{
-    startIdx = 0;
-    for (int i = 0; i < folderIdx; ++i)
-        startIdx += folderCounts[i];
-    endIdx = startIdx + folderCounts[folderIdx] - 1;
-}
-
-void switchToFolderMode()
-{
-    LOGLN("Switching to folder mode");
-    xSemaphoreTake(sdMutex, portMAX_DELAY);
-
-    // 1. Find the folder of the current track by reading the index file at currentIdx
-    String currentTrackPath;
-    File indexFile = SD.open("/index", FILE_READ);
-    if (indexFile)
-    {
-        for (int i = 0; i <= currentIdx; ++i)
-        {
-            currentTrackPath = indexFile.readStringUntil('\n');
-        }
-        indexFile.close();
-        currentTrackPath.trim();
-    }
-    else
-    {
-        LOGLN("Failed to open /index for folder mode");
-        xSemaphoreGive(sdMutex);
-        return;
-    }
-
-    LOG("Current track path: %s\n", currentTrackPath.c_str());
-
-    // Extract folder from currentTrackPath
-    int lastSlash = currentTrackPath.lastIndexOf('/');
-    String currentFolder = (lastSlash > 0) ? currentTrackPath.substring(0, lastSlash) : "/";
-
-    // 2. Find the folder index by scanning /index for folder boundaries
-    int folderIdx = -1;
-    String lastFolder = "";
-    File idxFile = SD.open("/index", FILE_READ);
-    if (idxFile)
-    {
-        while (idxFile.available())
-        {
-            String line = idxFile.readStringUntil('\n');
-            int slash = line.lastIndexOf('/');
-            String folder = (slash > 0) ? line.substring(0, slash) : "/";
-            if (line == currentTrackPath)
-            {
-                break;
-            }
-            if (folder != lastFolder)
-            {
-                folderIdx++;
-                lastFolder = folder;
-            }
-        }
-        idxFile.close();
-    }
-    else
-    {
-        LOGLN("Failed to open /index for folder scan");
-        xSemaphoreGive(sdMutex);
-        return;
-    }
-
-    // Save the folderIdx in currentFolderIdx
-    currentFolderIdx = folderIdx;
-
-    LOG("Current folder: %s (index %d)\n", currentFolder.c_str(), folderIdx);
-
-    // 3. Read folder counts from /folderindex
-    File folderIdxFile = SD.open("/folderindex", FILE_READ);
-    if (!folderIdxFile)
-    {
-        LOGLN("Failed to open /folderindex");
-        xSemaphoreGive(sdMutex);
-        return;
-    }
-    String line = folderIdxFile.readStringUntil('\n');
-    folderIdxFile.close();
-
-    // Parse folder counts
-    std::vector<int> folderCounts;
-    int start = 0;
-    while (start < line.length())
-    {
-        int end = line.indexOf(' ', start);
-        if (end == -1)
-            end = line.length();
-        String numStr = line.substring(start, end);
-        int val = numStr.toInt();
-        if (val > 0)
-            folderCounts.push_back(val);
-        start = end + 1;
-    }
-
-    // 4. Calculate start and end index for shuffler
-    int startIdx = 0;
-    for (int i = 0; i < folderIdx; ++i)
-        startIdx += folderCounts[i];
-    int endIdx = startIdx + folderCounts[folderIdx] - 1;
-
-    // 5. Set mode and shuffler, play track
-    currentMode = MODE_FOLDER;
-    shuffler.~LazyShuffler();
-    new (&shuffler) LazyShuffler(startIdx, endIdx);
-
-    LOG("Folder %d: startIdx=%d, endIdx=%d\n", folderIdx, startIdx, endIdx);
-
-    xSemaphoreGive(sdMutex);
-    LOG("Mutex given\n");
-}
-
-void switchToAllMode()
-{
-    LOGLN("Switching to all mode");
-    currentMode = MODE_ALL;
-    currentFolderIdx = -1;
-    shuffler.~LazyShuffler();
-    new (&shuffler) LazyShuffler(0, totalFiles - 1);
+    if (mp3.isRunning())
+        mp3.stop();
+    if (wav.isRunning())
+        wav.stop();
+    if (flac.isRunning())
+        flac.stop();
+    fileSrc.close();
 }
 
 void playTrack(int idx, uint32_t off)
@@ -535,24 +264,10 @@ void playTrack(int idx, uint32_t off)
         return;
     }
 
-    if (mp3.isRunning())
-        mp3.stop();
-    if (wav.isRunning())
-        wav.stop();
-    if (flac.isRunning())
-        flac.stop();
-    fileSrc.close();
-
-    LOG("Stopping previous track\n");
-
-    isPlaying = false;
-
-    currentIdx = idx;
-
     String currentPath;
     // Read the path from the index file at line number idx
 
-    LOG("waiting for sdMutex...\n");
+    LOGLN("Opening index file for reading path");
     xSemaphoreTake(sdMutex, portMAX_DELAY);
     File indexFile = SD.open("/index", FILE_READ);
     if (indexFile)
@@ -572,9 +287,6 @@ void playTrack(int idx, uint32_t off)
         return;
     }
 
-    LOG("Track path: %s\n", currentPath.c_str());
-    LOG("Track %u: %s  (seek %u bytes)\n", idx, currentPath.c_str(), off);
-
     xSemaphoreTake(sdMutex, portMAX_DELAY);
     if (!fileSrc.open(currentPath.c_str()))
     {
@@ -585,69 +297,33 @@ void playTrack(int idx, uint32_t off)
 
     if (currentPath.endsWith(".mp3") || currentPath.endsWith(".MP3"))
     {
+        currentIdx = idx;
         currentType = TYPE_MP3;
         if (off)
             fileSrc.seek(off, SEEK_SET);
         mp3.begin(&fileSrc, &audioOut);
-        isPlaying = mp3.isRunning();
     }
     else if (currentPath.endsWith(".wav") || currentPath.endsWith(".WAV"))
     {
+        currentIdx = idx;
         currentType = TYPE_WAV;
         wav.begin(&fileSrc, &audioOut);
-        isPlaying = wav.isRunning();
     }
     else if (currentPath.endsWith(".flac") || currentPath.endsWith(".FLAC"))
     {
+        currentIdx = idx;
         currentType = TYPE_FLAC;
         if (off)
             fileSrc.seek(off, SEEK_SET);
         flac.begin(&fileSrc, &audioOut);
-        isPlaying = flac.isRunning();
     }
     else
     {
         currentType = TYPE_UNKNOWN;
         LOGLN("unsupported file type");
     }
-
+    LOG("Playing %s\n", currentPath.c_str());
     xSemaphoreGive(sdMutex);
-}
-
-void switchToNextFolder()
-{
-    xSemaphoreTake(sdMutex, portMAX_DELAY);
-
-    std::vector<int> folderCounts = getFolderCounts();
-    if (folderCounts.empty())
-    {
-        LOGLN("No folder counts found");
-        xSemaphoreGive(sdMutex);
-        return;
-    }
-
-    int totalFolders = folderCounts.size();
-    LOG("Total folders: %d\n", totalFolders);
-    int nextFolderIdx = currentFolderIdx + 1;
-    LOG("Current folder index: %d\n", currentFolderIdx);
-
-    if (nextFolderIdx >= totalFolders)
-        nextFolderIdx = 0;
-
-    // Find the start index of the next folder in /index
-    int startIdx = 0, endIdx = 0;
-    getFolderStartEnd(folderCounts, nextFolderIdx, startIdx, endIdx);
-
-    // Set mode, update shuffler, and play first track in next folder
-    currentMode = MODE_FOLDER;
-    currentFolderIdx = nextFolderIdx;
-    shuffler.~LazyShuffler();
-    new (&shuffler) LazyShuffler(startIdx, endIdx);
-    LOG("Switching to folder %d (startIdx=%d, endIdx=%d)\n", nextFolderIdx, startIdx, endIdx);
-
-    xSemaphoreGive(sdMutex);
-
-    playTrack(shuffler.next(), 0);
 }
 
 void bookmarkTask(void *pv)
@@ -657,20 +333,20 @@ void bookmarkTask(void *pv)
     {
         if (xQueueReceive(bookmarkQueue, &pos, portMAX_DELAY) == pdTRUE)
         {
-            if (!isPlaying || !bookmarkFile)
+            if (!bookmarkFile)
                 continue;
 
             xSemaphoreTake(sdMutex, portMAX_DELAY);
             bookmarkFile.seek(0);
             // Save: currentIdx, pos, currentMode, currentFolderIdx
-            bookmarkFile.printf("%d %u %d %d\n", currentIdx, pos, (int)currentMode, currentFolderIdx);
+            bookmarkFile.printf("%d %d %u\n", totalFiles, currentIdx, pos);
             bookmarkFile.flush();
             xSemaphoreGive(sdMutex);
         }
     }
 }
 
-bool readBookmark(int &idx, uint32_t &off, int &mode, int &foIdx)
+bool readBookmark(int &idx, uint32_t &off, int &files)
 {
     xSemaphoreTake(sdMutex, portMAX_DELAY);
     if (!SD.exists("/bookmark"))
@@ -690,17 +366,15 @@ bool readBookmark(int &idx, uint32_t &off, int &mode, int &foIdx)
     f.close();
     xSemaphoreGive(sdMutex);
 
-    int read = sscanf(line.c_str(), "%d %u %d %d", &idx, &off, &mode, &foIdx);
+    int read = sscanf(line.c_str(), "%d %d %u", &files, &idx, &off);
 
-    return (read >= 2 && idx >= 0 && idx < totalFiles);
+    return true;
 }
 
 void nextTrack()
 {
     LOGLN("nextTrack() called");
     xQueueReset(bookmarkQueue);
-
-    LOGLN("Bookmark file flushed, waiting for lock...");
 
     int next = shuffler.next();
     if (currentIdx == next)
@@ -716,18 +390,102 @@ void previousTrack()
     LOGLN("previousTrack() called");
     xQueueReset(bookmarkQueue);
 
-    LOGLN("Bookmark file flushed, waiting for lock...");
-
     int last = shuffler.last();
     if (last < 0)
     {
-        // Optionally, replay current track or do nothing
         LOGLN("No previous track available");
-        // Optionally: playTrack(currentIdx, 0);
-        return;
+        playTrack(currentIdx, 0);
     }
+    else
+    {
+        playTrack(last, 0);
+    }
+}
 
-    playTrack(last, 0);
+static void volumeDown()
+{
+    if (volIndex > 0)
+    {
+        volIndex--;
+        audioOut.SetGain(volSteps[volIndex]);
+        blinkLed(2);
+        LOG("Vol: %.2f\n", volSteps[volIndex]);
+    }
+}
+
+static void volumeUp()
+{
+    if (volIndex < VOL_COUNT - 1)
+    {
+        volIndex++;
+        audioOut.SetGain(volSteps[volIndex]);
+        blinkLed(2);
+        LOG("Vol: %.2f\n", volSteps[volIndex]);
+    }
+}
+
+static void onVolumeUpButtonSingleClick(void *button_handle, void *user_data)
+{
+    volumeUp();
+    blinkLed(1);
+}
+
+static void onVolumeDownButtonSingleClick(void *button_handle, void *user_data)
+{
+    volumeDown();
+    blinkLed(1);
+}
+
+bool volume_up_button_hold = false;
+bool volume_down_button_hold = false;
+
+static void onVolumeUpButtonLongPressRelease(void *button_handle, void *user_data)
+{
+    nextTrack();
+    blinkLed(3);
+    volume_up_button_hold = false;
+}
+
+static void onVolumeDownButtonLongPressRelease(void *button_handle, void *user_data)
+{
+    previousTrack();
+    blinkLed(3);
+    volume_down_button_hold = false;
+}
+
+static void onVolumeUpButtonLongPressHold(void *button_handle, void *user_data)
+{
+    if (volume_down_button_hold)
+    {
+        xSemaphoreTake(sdMutex, portMAX_DELAY);
+        SD.remove("/bookmark");
+        SD.remove("/index");
+        xSemaphoreGive(sdMutex);
+        blinkLed(50);
+        LOGLN("Bookmark and index deleted");
+        esp_restart();
+    }
+    else
+    {
+        volume_up_button_hold = true;
+    }
+}
+
+static void onVolumeDownButtonLongPressHold(void *button_handle, void *user_data)
+{
+    if (volume_up_button_hold)
+    {
+        xSemaphoreTake(sdMutex, portMAX_DELAY);
+        SD.remove("/bookmark");
+        SD.remove("/index");
+        xSemaphoreGive(sdMutex);
+        LOGLN("Bookmark and index deleted");
+        esp_restart();
+    }
+    else
+    {
+        volume_down_button_hold = true;
+    }
 }
 
 void setup()
@@ -770,72 +528,26 @@ void setup()
             delay(1000);
     }
 
-    // read the folderindex file
-    // read all the int values from the first line in the file which are separated with spaces
-    // sum all the values up and write them to the variable totalFiles
-    File folderIdx = SD.open("/folderindex", FILE_READ);
-    if (folderIdx)
-    {
-        String line = folderIdx.readStringUntil('\n');
-        folderIdx.close();
-        totalFiles = 0;
-        int start = 0;
-        while (start < line.length())
-        {
-            int end = line.indexOf(' ', start);
-            if (end == -1)
-                end = line.length();
-            String numStr = line.substring(start, end);
-            int val = numStr.toInt();
-            if (val > 0)
-                totalFiles += val;
-            start = end + 1;
-        }
-        LOG("Total files from folderindex: %d\n", totalFiles);
-    }
-    else
-    {
-        LOGLN("Failed to open /folderindex");
-        totalFiles = -1;
-    }
-
-    shuffler = LazyShuffler(0, totalFiles - 1);
-
     int idx;
     uint32_t off;
     int mode;
     int foIdx;
-    bool bookmarkFound = readBookmark(idx, off, mode, foIdx);
+    int total;
+    bool bookmarkFound = readBookmark(idx, off, total);
     LOGLN(bookmarkFound ? "Bookmark file opened" : "No bookmark found");
+
+    if (total > 0)
+    {
+        totalFiles = total;
+    }
+
+    shuffler = LazyShuffler(0, totalFiles - 1);
+
     if (bookmarkFound)
     {
-        currentMode = static_cast<PlayMode>(mode);
-        currentFolderIdx = foIdx;
+        LOG("Bookmark: %d %u %u\n", idx, off, total);
         LOG("Resume track %d @ byte %u\n", idx, off);
-
-        if (currentMode == MODE_FOLDER)
-        {
-            std::vector<int> folderCounts = getFolderCounts();
-            if (currentFolderIdx < 0 || currentFolderIdx >= folderCounts.size())
-            {
-                LOGLN("Invalid folder index in bookmark");
-                currentMode = MODE_ALL;
-                currentFolderIdx = -1;
-            }
-            else
-            {
-                int startIdx = 0, endIdx = 0;
-                getFolderStartEnd(folderCounts, currentFolderIdx, startIdx, endIdx);
-                shuffler.~LazyShuffler();
-                new (&shuffler) LazyShuffler(startIdx, endIdx);
-            }
-
-            playTrack(idx, off);
-        }
-        else
-        {
-            playTrack(idx, off);
-        }
+        playTrack(idx, off);
     }
     else
     {
@@ -849,263 +561,70 @@ void setup()
     }
 
     bookmarkQueue = xQueueCreate(5, sizeof(uint32_t));
-    xTaskCreatePinnedToCore(bookmarkTask, "bookmarkTask", 4096, NULL, 1, NULL, 0);
+    xTaskCreatePinnedToCore(bookmarkTask, "bookmarkTask", 4096, NULL, 2, NULL, 0);
 
-    // button setup
-    pinMode(BTN_VOL_UP, INPUT_PULLUP);
-    pinMode(BTN_VOL_DN, INPUT_PULLUP);
     pinMode(LED_PIN, OUTPUT);
     digitalWrite(LED_PIN, LOW); // LED off by default
 
-    extern bool lastUpState, lastDnState;
-    extern bool upHeld, dnHeld;
-    lastUpState = digitalRead(BTN_VOL_UP);
-    lastDnState = digitalRead(BTN_VOL_DN);
-    upHeld = lastUpState;
-    dnHeld = lastDnState;
+    Button *volUpBtn = new Button(BTN_VOL_UP, false);
+    volUpBtn->attachSingleClickEventCb(onVolumeUpButtonSingleClick, NULL);
+    volUpBtn->attachLongPressUpEventCb(onVolumeUpButtonLongPressRelease, NULL);
+    volUpBtn->attachLongPressHoldEventCb(onVolumeUpButtonLongPressHold, NULL);
+
+    Button *volDnBtn = new Button(BTN_VOL_DN, false);
+    volDnBtn->attachSingleClickEventCb(onVolumeDownButtonSingleClick, NULL);
+    volDnBtn->attachLongPressUpEventCb(onVolumeDownButtonLongPressRelease, NULL);
+    volDnBtn->attachLongPressHoldEventCb(onVolumeDownButtonLongPressHold, NULL);
 }
 
 void loop()
 {
     unsigned long now = millis();
-    static bool bothHeld = false;
-    static unsigned long sharedDownTime = 0;
-    static bool bothActionTriggered = false;
-    static unsigned long lastPrevPressTime = 0;
-    if (isPlaying)
+
+    bool active = false;
+    xSemaphoreTake(sdMutex, portMAX_DELAY);
+    switch (currentType)
     {
-        bool active = false;
-        xSemaphoreTake(sdMutex, portMAX_DELAY);
-        switch (currentType)
-        {
-        case TYPE_MP3:
-            active = mp3.loop();
-            break;
-        case TYPE_WAV:
-            active = wav.loop();
-            break;
-        case TYPE_FLAC:
-            active = flac.loop();
-            break;
-        default:
-            active = false;
-            break;
-        }
-        xSemaphoreGive(sdMutex);
+    case TYPE_MP3:
+        active = mp3.loop();
+        break;
+    case TYPE_WAV:
+        active = wav.loop();
+        break;
+    case TYPE_FLAC:
+        active = flac.loop();
+        break;
+    default:
+        active = false;
+        break;
+    }
+    xSemaphoreGive(sdMutex);
 
-        if (!active)
-        {
-            LOGLN("loop() returned false — decoder done");
-            isPlaying = false;
-            uint32_t flushDummy = fileSrc.getPos();
-            delay(10);
-            nextTrack();
-            return;
-        }
-
-        if (now - lastBookmarkMs > 5000)
-        {
-            unsigned long now = millis();
-            uint32_t pos = 0;
-            if (fileSrc.isOpen())
-            {
-                pos = fileSrc.getPos();
-            }
-            else
-            {
-                LOGLN("fileSrc not open during bookmark getPos()");
-            }
-            if (pos > 0)
-            {
-                xQueueSend(bookmarkQueue, &pos, 0);
-                lastBookmarkMs = now;
-                LOG("Queued bookmark %u @ %u bytes\n", currentIdx, pos);
-            }
-        }
+    if (!active)
+    {
+        LOGLN("track finished, playing next");
+        delay(10);
+        nextTrack();
+        return;
     }
 
-    // Debounce and state for buttons
-    const unsigned long debounceDelay = 50;
-    static unsigned long lastUpDebounceTime = 0;
-    static unsigned long lastDnDebounceTime = 0;
-    static unsigned long downTimeUp = 0, downTimeDn = 0;
-    static bool upActionTriggered = false, dnActionTriggered = false;
-
-    if (!buttonsLocked())
+    else if (now - lastBookmarkMs > 1000)
     {
-
-        // Volume Up / Skip with debounce
-        bool upReading = digitalRead(BTN_VOL_UP);
-        if (upReading != lastUpState)
+        unsigned long now = millis();
+        uint32_t pos = 0;
+        if (fileSrc.isOpen())
         {
-            lastUpDebounceTime = now;
+            pos = fileSrc.getPos();
         }
-        if ((now - lastUpDebounceTime) > debounceDelay)
+        else
         {
-            if (!(upHeld == LOW && dnHeld == LOW))
-            {
-                if (upReading != upHeld)
-                {
-                    upHeld = upReading;
-                    if (upHeld == LOW)
-                    {
-                        downTimeUp = now;
-                        upActionTriggered = false;
-                    }
-                    else
-                    {
-                        if (!upActionTriggered)
-                        {
-                            unsigned long heldTime = now - downTimeUp;
-                            if (heldTime > 1500)
-                            {
-                                LOGLN("Volume up held for 1.5s, skipping track");
-                                nextTrack();
-                                blinkLed(5);
-                            }
-                            else if (volIndex < VOL_COUNT - 1)
-                            {
-                                volIndex++;
-                                audioOut.SetGain(volSteps[volIndex]);
-                                blinkLed(2);
-                                LOG("Vol: %.2f\n", volSteps[volIndex]);
-                            }
-                        }
-                    }
-                }
-
-                if (upHeld == LOW && !upActionTriggered)
-                {
-                    unsigned long heldTime = now - downTimeUp;
-                    if (heldTime > 1500)
-                    {
-                        nextTrack();
-                        blinkLed(5);
-                        upActionTriggered = true;
-                    }
-                }
-            }
+            LOGLN("fileSrc not open during bookmark getPos()");
         }
-        lastUpState = upReading;
-
-        // Volume Down / Restart or Previous with debounce
-        bool dnReading = digitalRead(BTN_VOL_DN);
-        if (dnReading != lastDnState)
+        if (pos >= 0)
         {
-            lastDnDebounceTime = now;
+            xQueueSend(bookmarkQueue, &pos, 0);
+            lastBookmarkMs = now;
+            LOG("Queued bookmark %u @ %u bytes\n", currentIdx, pos);
         }
-        if ((now - lastDnDebounceTime) > debounceDelay)
-        {
-            if (!(upHeld == LOW && dnHeld == LOW))
-            {
-                if (dnReading != dnHeld)
-                {
-                    dnHeld = dnReading;
-                    if (dnHeld == LOW)
-                    {
-                        downTimeDn = now;
-                        dnActionTriggered = false;
-                    }
-                    else
-                    {
-                        if (!dnActionTriggered)
-                        {
-                            unsigned long heldTime = now - downTimeDn;
-                            if (heldTime > 1500)
-                            {
-                                unsigned long timeSinceLast = now - lastPrevPressTime;
-                                lastPrevPressTime = now;
-
-                                if (timeSinceLast < 10000)
-                                {
-                                    previousTrack();
-                                    blinkLed(5);
-                                }
-                                else
-                                {
-                                    playTrack(currentIdx, 0);
-                                    blinkLed(5);
-                                }
-                            }
-                            else if (volIndex > 0)
-                            {
-                                volIndex--;
-                                audioOut.SetGain(volSteps[volIndex]);
-                                blinkLed(2);
-                                LOG("Vol: %.2f\n", volSteps[volIndex]);
-                            }
-                        }
-                    }
-                }
-
-                if (dnHeld == LOW && !dnActionTriggered)
-                {
-                    unsigned long heldTime = now - downTimeDn;
-                    if (heldTime > 1500)
-                    {
-                        unsigned long timeSinceLast = now - lastPrevPressTime;
-                        lastPrevPressTime = now;
-
-                        if (timeSinceLast < 10000)
-                        {
-                            previousTrack();
-                            blinkLed(5);
-                        }
-                        else
-                        {
-                            playTrack(currentIdx, 0);
-                            blinkLed(5);
-                        }
-                        dnActionTriggered = true;
-                    }
-                }
-            }
-        }
-
-        // Check for simultaneous button press (after individual handling)
-        if (upHeld == LOW && dnHeld == LOW && !bothHeld)
-        {
-            bothHeld = true;
-            sharedDownTime = now;
-            bothActionTriggered = false;
-        }
-
-        if (bothHeld && upReading == HIGH && dnReading == HIGH)
-        {
-            bothHeld = false;
-            unsigned long heldTime = now - sharedDownTime;
-
-            if (!bothActionTriggered)
-            {
-                if (heldTime > 1500)
-                {
-                    if (currentMode == MODE_ALL)
-                    {
-                        switchToFolderMode();
-                    }
-                    else
-                    {
-                        switchToAllMode();
-                    }
-                }
-                else if (currentMode == MODE_FOLDER)
-                {
-                    switchToNextFolder();
-                }
-            }
-
-            bothActionTriggered = false;
-            upHeld = upReading;
-            dnHeld = dnReading;
-        }
-        lastDnState = dnReading;
-    }
-
-    // 3-second LED blink in folder mode
-    static unsigned long lastFolderBlink = 0;
-    if (currentMode == MODE_FOLDER && now - lastFolderBlink > 3000)
-    {
-        blinkLed(1);
-        lastFolderBlink = now;
     }
 }
