@@ -5,7 +5,6 @@
 SemaphoreHandle_t sdMutex;
 #include <vector>
 #include <SD.h>
-#include <SPI.h>
 #include <AudioFileSourceSD.h>
 #include <AudioGeneratorMP3.h>
 #include <AudioGeneratorWAV.h>
@@ -13,7 +12,6 @@ SemaphoreHandle_t sdMutex;
 #include <AudioOutputI2S.h>
 #include "esp_system.h"
 #include <freertos/queue.h>
-#include <cstdio>
 #include <WiFi.h>
 #include <unordered_set>
 #include <Button.h>
@@ -95,9 +93,9 @@ public:
         if (history.size() < 2)
             return -1;
         // Remove the latest number
+        used.erase(history.back());
         history.pop_back();
         int prev = history.back();
-        used.erase(prev); // allow it to be picked again if needed
         return prev;
     }
 
@@ -107,11 +105,11 @@ private:
     std::vector<int> history;
 };
 
-AudioFileSourceSD fileSrc;
-AudioGeneratorMP3 mp3;
-AudioGeneratorWAV wav;
-AudioGeneratorFLAC flac;
-AudioOutputI2S audioOut;
+AudioFileSourceSD *fileSrc = nullptr;
+AudioGeneratorMP3 *mp3 = nullptr;
+AudioGeneratorWAV *wav = nullptr;
+AudioGeneratorFLAC *flac = nullptr;
+AudioOutputI2S *audioOut = nullptr;
 enum AudioType
 {
     TYPE_MP3,
@@ -124,6 +122,7 @@ int totalFiles = -1;
 int currentIdx = -1;
 unsigned long lastBookmarkMs = 0;
 LazyShuffler shuffler(0, 0);
+bool lockLoop = false;
 
 // fixed volume steps
 const float volSteps[] = {
@@ -193,7 +192,9 @@ bool writeIndexFile()
     File root = SD.open("/");
     writePaths(root, "");
     root.close();
+    indexFile.flush();
     indexFile.close();
+    delay(1000);
 
     if (fileCount == 0)
     {
@@ -243,15 +244,118 @@ void blinkLed(int times)
         "blinkTask", 1024, blinkCount, 1, &blinkTaskHandle);
 }
 
+void blinkWelcomeMessage()
+{
+    // Morse code for "HELLO THERE"
+    // H: ....  E: .  L: .-..  L: .-..  O: ---
+    // T: -  H: ....  E: .  R: .-.  E: .
+    const char *morse = ".... . .-.. .-.. ---   - .... . .-. .";
+    // Timing: dot=1, dash=3, intra-char=1, inter-char=3, inter-word=7 units
+    // We'll use 100ms as one unit
+    const int dotLen = 10;
+    const int dashLen = 3 * dotLen;
+    const int intraCharGap = dotLen;
+    const int interCharGap = 3 * dotLen;
+    const int interWordGap = 7 * dotLen;
+
+    if (blinkTaskHandle != NULL)
+    {
+        if (eTaskGetState(blinkTaskHandle) != eDeleted)
+        {
+            vTaskDelete(blinkTaskHandle);
+        }
+        blinkTaskHandle = NULL;
+    }
+
+    xTaskCreate(
+        [](void *param)
+        {
+            const char *morse = (const char *)param;
+            for (const char *p = morse; *p; ++p)
+            {
+                if (*p == '.')
+                {
+                    digitalWrite(LED_PIN, HIGH);
+                    vTaskDelay(dotLen / portTICK_PERIOD_MS);
+                    digitalWrite(LED_PIN, LOW);
+                    vTaskDelay(intraCharGap / portTICK_PERIOD_MS);
+                }
+                else if (*p == '-')
+                {
+                    digitalWrite(LED_PIN, HIGH);
+                    vTaskDelay(dashLen / portTICK_PERIOD_MS);
+                    digitalWrite(LED_PIN, LOW);
+                    vTaskDelay(intraCharGap / portTICK_PERIOD_MS);
+                }
+                else if (*p == ' ')
+                {
+                    // Check for triple space (word gap)
+                    if (*(p + 1) == ' ' && *(p + 2) == ' ')
+                    {
+                        vTaskDelay((interWordGap - intraCharGap) / portTICK_PERIOD_MS);
+                        p += 2;
+                    }
+                    else
+                    {
+                        vTaskDelay((interCharGap - intraCharGap) / portTICK_PERIOD_MS);
+                    }
+                }
+            }
+            vTaskDelete(NULL);
+            vTaskDelay(1);
+        },
+        "morseBlink", 1024, (void *)morse, 1, &blinkTaskHandle);
+}
+
 void stopPlayback()
 {
-    if (mp3.isRunning())
-        mp3.stop();
-    if (wav.isRunning())
-        wav.stop();
-    if (flac.isRunning())
-        flac.stop();
-    fileSrc.close();
+    if (mp3 && mp3->isRunning())
+    {
+        mp3->stop();
+        delete mp3;
+        mp3 = nullptr;
+    }
+    if (wav && wav->isRunning())
+    {
+        wav->stop();
+        delete wav;
+        wav = nullptr;
+    }
+    if (flac && flac->isRunning())
+    {
+        flac->stop();
+        delete flac;
+        flac = nullptr;
+    }
+    if (fileSrc)
+    {
+        fileSrc->close();
+        delete fileSrc;
+        fileSrc = nullptr;
+    }
+}
+
+uint32_t skipID3v2Tag(AudioFileSource *src)
+{
+    char header[10];
+    if (src->read((uint8_t *)header, 10) != 10)
+        return 0;
+
+    if (memcmp(header, "ID3", 3) != 0)
+    {
+        src->seek(0, SEEK_SET); // not an ID3v2 tag
+        return 0;
+    }
+
+    uint32_t tagSize =
+        ((header[6] & 0x7F) << 21) |
+        ((header[7] & 0x7F) << 14) |
+        ((header[8] & 0x7F) << 7) |
+        (header[9] & 0x7F);
+
+    uint32_t skipBytes = tagSize + 10; // +10 header
+    src->seek(skipBytes, SEEK_SET);
+    return skipBytes;
 }
 
 void playTrack(int idx, uint32_t off)
@@ -265,10 +369,39 @@ void playTrack(int idx, uint32_t off)
     }
 
     String currentPath;
-    // Read the path from the index file at line number idx
 
     LOGLN("Opening index file for reading path");
     xSemaphoreTake(sdMutex, portMAX_DELAY);
+
+    lockLoop = true;
+    xQueueReset(bookmarkQueue);
+
+    // Stop any running decoder and cleanup
+    if (mp3 && mp3->isRunning())
+    {
+        mp3->stop();
+        delete mp3;
+        mp3 = nullptr;
+    }
+    if (wav && wav->isRunning())
+    {
+        wav->stop();
+        delete wav;
+        wav = nullptr;
+    }
+    if (flac && flac->isRunning())
+    {
+        flac->stop();
+        delete flac;
+        flac = nullptr;
+    }
+    if (fileSrc)
+    {
+        fileSrc->close();
+        delete fileSrc;
+        fileSrc = nullptr;
+    }
+
     File indexFile = SD.open("/index", FILE_READ);
     if (indexFile)
     {
@@ -284,44 +417,69 @@ void playTrack(int idx, uint32_t off)
     {
         LOGLN("Failed to open /index for reading path");
         xSemaphoreGive(sdMutex);
+        lockLoop = false;
         return;
     }
 
     xSemaphoreTake(sdMutex, portMAX_DELAY);
-    if (!fileSrc.open(currentPath.c_str()))
+
+    fileSrc = new AudioFileSourceSD();
+    if (currentPath.isEmpty() || !fileSrc->open(currentPath.c_str()))
     {
         LOGLN("file open failed");
+        delete fileSrc;
+        fileSrc = nullptr;
         xSemaphoreGive(sdMutex);
+        lockLoop = false;
         return;
+    }
+
+    // Ensure audioOut is allocated
+    if (!audioOut)
+    {
+        audioOut = new AudioOutputI2S();
+        audioOut->SetPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
+        audioOut->begin();
+        audioOut->SetGain(volSteps[volIndex]);
     }
 
     if (currentPath.endsWith(".mp3") || currentPath.endsWith(".MP3"))
     {
         currentIdx = idx;
         currentType = TYPE_MP3;
-        if (off)
-            fileSrc.seek(off, SEEK_SET);
-        mp3.begin(&fileSrc, &audioOut);
+        if (off == 0)
+        {
+            uint32_t skipped = skipID3v2Tag(fileSrc);
+            LOG("Skipped %u bytes of ID3v2 tag\n", skipped);
+        }
+        else
+        {
+            fileSrc->seek(off, SEEK_SET);
+        }
+        mp3 = new AudioGeneratorMP3();
+        mp3->begin(fileSrc, audioOut);
     }
     else if (currentPath.endsWith(".wav") || currentPath.endsWith(".WAV"))
     {
         currentIdx = idx;
         currentType = TYPE_WAV;
-        wav.begin(&fileSrc, &audioOut);
+        wav = new AudioGeneratorWAV();
+        wav->begin(fileSrc, audioOut);
     }
     else if (currentPath.endsWith(".flac") || currentPath.endsWith(".FLAC"))
     {
         currentIdx = idx;
         currentType = TYPE_FLAC;
-        if (off)
-            fileSrc.seek(off, SEEK_SET);
-        flac.begin(&fileSrc, &audioOut);
+        fileSrc->seek(off, SEEK_SET);
+        flac = new AudioGeneratorFLAC();
+        flac->begin(fileSrc, audioOut);
     }
     else
     {
         currentType = TYPE_UNKNOWN;
         LOGLN("unsupported file type");
     }
+    lockLoop = false;
     LOG("Playing %s\n", currentPath.c_str());
     xSemaphoreGive(sdMutex);
 }
@@ -339,14 +497,14 @@ void bookmarkTask(void *pv)
             xSemaphoreTake(sdMutex, portMAX_DELAY);
             bookmarkFile.seek(0);
             // Save: currentIdx, pos, currentMode, currentFolderIdx
-            bookmarkFile.printf("%d %d %u\n", totalFiles, currentIdx, pos);
+            bookmarkFile.printf("%d %d %u %d\n", totalFiles, currentIdx, pos, volIndex);
             bookmarkFile.flush();
             xSemaphoreGive(sdMutex);
         }
     }
 }
 
-bool readBookmark(int &idx, uint32_t &off, int &files)
+bool readBookmark(int &idx, uint32_t &off, int &files, int &vol)
 {
     xSemaphoreTake(sdMutex, portMAX_DELAY);
     if (!SD.exists("/bookmark"))
@@ -366,7 +524,7 @@ bool readBookmark(int &idx, uint32_t &off, int &files)
     f.close();
     xSemaphoreGive(sdMutex);
 
-    int read = sscanf(line.c_str(), "%d %d %u", &files, &idx, &off);
+    int read = sscanf(line.c_str(), "%d %d %u %d", &files, &idx, &off, &vol);
 
     return true;
 }
@@ -374,7 +532,6 @@ bool readBookmark(int &idx, uint32_t &off, int &files)
 void nextTrack()
 {
     LOGLN("nextTrack() called");
-    xQueueReset(bookmarkQueue);
 
     int next = shuffler.next();
     if (currentIdx == next)
@@ -388,7 +545,6 @@ void nextTrack()
 void previousTrack()
 {
     LOGLN("previousTrack() called");
-    xQueueReset(bookmarkQueue);
 
     int last = shuffler.last();
     if (last < 0)
@@ -404,22 +560,22 @@ void previousTrack()
 
 static void volumeDown()
 {
-    if (volIndex > 0)
+    if (volIndex > 0 && audioOut)
     {
         volIndex--;
-        audioOut.SetGain(volSteps[volIndex]);
-        blinkLed(2);
+        audioOut->SetGain(volSteps[volIndex]);
+        blinkLed(1);
         LOG("Vol: %.2f\n", volSteps[volIndex]);
     }
 }
 
 static void volumeUp()
 {
-    if (volIndex < VOL_COUNT - 1)
+    if (volIndex < VOL_COUNT - 1 && audioOut)
     {
         volIndex++;
-        audioOut.SetGain(volSteps[volIndex]);
-        blinkLed(2);
+        audioOut->SetGain(volSteps[volIndex]);
+        blinkLed(1);
         LOG("Vol: %.2f\n", volSteps[volIndex]);
     }
 }
@@ -427,13 +583,11 @@ static void volumeUp()
 static void onVolumeUpButtonSingleClick(void *button_handle, void *user_data)
 {
     volumeUp();
-    blinkLed(1);
 }
 
 static void onVolumeDownButtonSingleClick(void *button_handle, void *user_data)
 {
     volumeDown();
-    blinkLed(1);
 }
 
 bool volume_up_button_hold = false;
@@ -492,6 +646,8 @@ void setup()
 {
     WiFi.mode(WIFI_OFF);
     btStop();
+    srand(millis() ^ touchRead(T0));
+    blinkWelcomeMessage();
 #if SERIAL_OUTPUT
     Serial.begin(115200);
     while (!Serial)
@@ -516,10 +672,13 @@ void setup()
     }
     LOGLN("SD OK");
 
-    audioOut.SetPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
-    audioOut.SetGain(volSteps[volIndex]);
-    audioOut.begin();
-    LOGLN("I²S OK");
+    if (!audioOut)
+    {
+        audioOut = new AudioOutputI2S();
+        audioOut->SetPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
+        audioOut->begin();
+        LOGLN("I²S OK");
+    }
 
     if (!writeIndexFile())
     {
@@ -528,31 +687,26 @@ void setup()
             delay(1000);
     }
 
-    int idx;
-    uint32_t off;
-    int mode;
-    int foIdx;
-    int total;
-    bool bookmarkFound = readBookmark(idx, off, total);
+    int idx = 0;
+    uint32_t off = 0;
+    int total = totalFiles;
+    int vol = volIndex;
+    bool bookmarkFound = readBookmark(idx, off, total, vol);
     LOGLN(bookmarkFound ? "Bookmark file opened" : "No bookmark found");
 
-    if (total > 0)
-    {
-        totalFiles = total;
-    }
+    if (total <= 0)
+        LOGLN("No files found.");
+
+    while (total <= 0)
+        delay(100);
+
+    totalFiles = total;
+
+    volIndex = vol;
+    if (audioOut)
+        audioOut->SetGain(volSteps[volIndex]);
 
     shuffler = LazyShuffler(0, totalFiles - 1);
-
-    if (bookmarkFound)
-    {
-        LOG("Bookmark: %d %u %u\n", idx, off, total);
-        LOG("Resume track %d @ byte %u\n", idx, off);
-        playTrack(idx, off);
-    }
-    else
-    {
-        playTrack(shuffler.next(), 0);
-    }
 
     bookmarkFile = SD.open("/bookmark", FILE_WRITE);
     if (!bookmarkFile)
@@ -561,7 +715,18 @@ void setup()
     }
 
     bookmarkQueue = xQueueCreate(5, sizeof(uint32_t));
-    xTaskCreatePinnedToCore(bookmarkTask, "bookmarkTask", 4096, NULL, 2, NULL, 0);
+    xTaskCreatePinnedToCore(bookmarkTask, "bookmarkTask", 4096, NULL, 2, NULL, 1);
+
+    if (bookmarkFound)
+    {
+        LOG("Bookmark: %d %u %u\n", idx, off, total, vol);
+        LOG("Resume track %d @ byte %u\n", idx, off);
+        playTrack(idx, off);
+    }
+    else
+    {
+        playTrack(shuffler.next(), 0);
+    }
 
     pinMode(LED_PIN, OUTPUT);
     digitalWrite(LED_PIN, LOW); // LED off by default
@@ -581,18 +746,27 @@ void loop()
 {
     unsigned long now = millis();
 
+    if (lockLoop)
+    {
+        LOGLN("Loop locked.");
+        return;
+    }
+
     bool active = false;
     xSemaphoreTake(sdMutex, portMAX_DELAY);
     switch (currentType)
     {
     case TYPE_MP3:
-        active = mp3.loop();
+        if (mp3)
+            active = mp3->isRunning() && mp3->loop();
         break;
     case TYPE_WAV:
-        active = wav.loop();
+        if (wav)
+            active = wav->isRunning() && wav->loop();
         break;
     case TYPE_FLAC:
-        active = flac.loop();
+        if (flac)
+            active = flac->isRunning() && flac->loop();
         break;
     default:
         active = false;
@@ -607,14 +781,13 @@ void loop()
         nextTrack();
         return;
     }
-
     else if (now - lastBookmarkMs > 1000)
     {
         unsigned long now = millis();
         uint32_t pos = 0;
-        if (fileSrc.isOpen())
+        if (fileSrc && fileSrc->isOpen())
         {
-            pos = fileSrc.getPos();
+            pos = fileSrc->getPos();
         }
         else
         {
