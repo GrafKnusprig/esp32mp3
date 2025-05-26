@@ -79,7 +79,7 @@ public:
         int val;
         do
         {
-            val = start + rand() % total;
+            val = start + esp_random() % total;
         } while (used.find(val) != used.end());
 
         used.insert(val);
@@ -644,9 +644,9 @@ static void onVolumeDownButtonLongPressHold(void *button_handle, void *user_data
 
 void setup()
 {
-    WiFi.mode(WIFI_OFF);
-    btStop();
-    srand(millis() ^ touchRead(T0));
+    //WiFi.mode(WIFI_OFF);
+    //btStop();
+    //srand(millis() ^ touchRead(T0));
     blinkWelcomeMessage();
 #if SERIAL_OUTPUT
     Serial.begin(115200);
