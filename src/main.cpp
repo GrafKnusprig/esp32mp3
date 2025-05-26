@@ -123,6 +123,7 @@ int currentIdx = -1;
 unsigned long lastBookmarkMs = 0;
 LazyShuffler shuffler(0, 0);
 bool lockLoop = false;
+unsigned long lastSkip = 0;
 
 // fixed volume steps
 const float volSteps[] = {
@@ -546,16 +547,25 @@ void previousTrack()
 {
     LOGLN("previousTrack() called");
 
-    int last = shuffler.last();
-    if (last < 0)
+    unsigned long now = millis();
+    if (now - lastSkip > 5000)
     {
-        LOGLN("No previous track available");
         playTrack(currentIdx, 0);
     }
     else
     {
-        playTrack(last, 0);
+        int last = shuffler.last();
+        if (last < 0)
+        {
+            LOGLN("No previous track available");
+            playTrack(currentIdx, 0);
+        }
+        else
+        {
+            playTrack(last, 0);
+        }
     }
+    lastSkip = now;
 }
 
 static void volumeDown()
@@ -593,21 +603,27 @@ static void onVolumeDownButtonSingleClick(void *button_handle, void *user_data)
 bool volume_up_button_hold = false;
 bool volume_down_button_hold = false;
 
-static void onVolumeUpButtonLongPressRelease(void *button_handle, void *user_data)
+static void onVolumeUpButtonPressDown(void *button_handle, void *user_data)
 {
-    nextTrack();
-    blinkLed(3);
+    volume_up_button_hold = true;
+}
+
+static void onVolumeUpButtonPressUp(void *button_handle, void *user_data)
+{
     volume_up_button_hold = false;
 }
 
-static void onVolumeDownButtonLongPressRelease(void *button_handle, void *user_data)
+static void onVolumeDownButtonPressDown(void *button_handle, void *user_data)
 {
-    previousTrack();
-    blinkLed(3);
+    volume_down_button_hold = true;
+}
+
+static void onVolumeDownButtonPressUp(void *button_handle, void *user_data)
+{
     volume_down_button_hold = false;
 }
 
-static void onVolumeUpButtonLongPressHold(void *button_handle, void *user_data)
+static void onVolumeUpButtonLongPressStart(void *button_handle, void *user_data)
 {
     if (volume_down_button_hold)
     {
@@ -621,11 +637,11 @@ static void onVolumeUpButtonLongPressHold(void *button_handle, void *user_data)
     }
     else
     {
-        volume_up_button_hold = true;
+        nextTrack();
     }
 }
 
-static void onVolumeDownButtonLongPressHold(void *button_handle, void *user_data)
+static void onVolumeDownButtonLongPressStart(void *button_handle, void *user_data)
 {
     if (volume_up_button_hold)
     {
@@ -638,15 +654,15 @@ static void onVolumeDownButtonLongPressHold(void *button_handle, void *user_data
     }
     else
     {
-        volume_down_button_hold = true;
+        previousTrack();
     }
 }
 
 void setup()
 {
-    //WiFi.mode(WIFI_OFF);
-    //btStop();
-    //srand(millis() ^ touchRead(T0));
+    // WiFi.mode(WIFI_OFF);
+    // btStop();
+    // srand(millis() ^ touchRead(T0));
     blinkWelcomeMessage();
 #if SERIAL_OUTPUT
     Serial.begin(115200);
@@ -733,13 +749,15 @@ void setup()
 
     Button *volUpBtn = new Button(BTN_VOL_UP, false);
     volUpBtn->attachSingleClickEventCb(onVolumeUpButtonSingleClick, NULL);
-    volUpBtn->attachLongPressUpEventCb(onVolumeUpButtonLongPressRelease, NULL);
-    volUpBtn->attachLongPressHoldEventCb(onVolumeUpButtonLongPressHold, NULL);
+    volUpBtn->attachPressDownEventCb(onVolumeUpButtonPressDown, NULL);
+    volUpBtn->attachPressUpEventCb(onVolumeUpButtonPressUp, NULL);
+    volUpBtn->attachLongPressStartEventCb(onVolumeUpButtonLongPressStart, NULL);
 
     Button *volDnBtn = new Button(BTN_VOL_DN, false);
     volDnBtn->attachSingleClickEventCb(onVolumeDownButtonSingleClick, NULL);
-    volDnBtn->attachLongPressUpEventCb(onVolumeDownButtonLongPressRelease, NULL);
-    volDnBtn->attachLongPressHoldEventCb(onVolumeDownButtonLongPressHold, NULL);
+    volDnBtn->attachPressDownEventCb(onVolumeDownButtonPressDown, NULL);
+    volDnBtn->attachPressUpEventCb(onVolumeDownButtonPressUp, NULL);
+    volDnBtn->attachLongPressStartEventCb(onVolumeDownButtonLongPressStart, NULL);
 }
 
 void loop()
