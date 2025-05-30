@@ -15,34 +15,31 @@ SemaphoreHandle_t sdMutex;
 #include <WiFi.h>
 #include <unordered_set>
 #include <Button.h>
+#include <Adafruit_NeoPixel.h>
 
-// ESP32 Dev Kit                   SD Card Module
-// ┌──────────────┐                ┌─────────────┐
-// │        3.3V  ────────────────▶│ VCC         │
-// │         GND  ────────────────▶│ GND         │
-// │        GPIO19────────────────▶│ MISO        │
-// │        GPIO23────────────────▶│ MOSI        │
-// │        GPIO18────────────────▶│ SCK         │
-// │         GPIO5────────────────▶│ CS          │
-// └──────────────┘                └─────────────┘
+// Pin definitions
+#define SD_CS 5
+#define I2S_BCLK 26
+#define I2S_LRC 25
+#define I2S_DOUT 22
+#define BTN_VOL_UP GPIO_NUM_33
+#define BTN_VOL_DN GPIO_NUM_27
+#define BTN_MODE   GPIO_NUM_32
+#define LED_PIN 2
+#define NEOPIXEL_PIN 21
+#define NEOPIXEL_COUNT 1
 
-// ESP32 Dev Kit                   PCM5100 DAC Module
-// ┌──────────────┐                ┌─────────────┐
-// │        3.3V  ────────────────▶│ VCC         │
-// │         GND  ────────────────▶│ GND         │
-// │        GPIO22────────────────▶│ DIN (DATA)  │
-// │        GPIO26────────────────▶│ BCK (BITCLK)│
-// │        GPIO25────────────────▶│ LRC (LRCLK) │
-// └──────────────┘                └─────────────┘
+// NeoPixel setup
+Adafruit_NeoPixel strip(NEOPIXEL_COUNT, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
+uint8_t ledMode = 0; // 0=OFF, 1=RED, 2=GREEN, 3=BLUE
+const uint32_t ledColors[] = {0x000000, 0xFF0000, 0x00FF00, 0x0000FF};
+void updateNeoPixel() {
+    strip.setPixelColor(0, ledColors[ledMode]);
+    strip.show();
+}
 
-// ESP32 Dev Kit                   Buttons
-// ┌──────────────┐                ┌─────────────┐
-// │        GPIO33────────────────▶│ BTN_VOL_UP  │
-// │        GPIO27────────────────▶│ BTN_VOL_DN  │
-// └──────────────┘                └─────────────┘
-
+// Serial logging
 #define SERIAL_OUTPUT 1
-
 #if SERIAL_OUTPUT
 #define LOG(...) Serial.printf(__VA_ARGS__)
 #define LOGLN(...) Serial.println(__VA_ARGS__)
@@ -51,14 +48,6 @@ SemaphoreHandle_t sdMutex;
 #define LOGLN(...) (void)0
 #endif
 
-#define SD_CS 5
-#define I2S_BCLK 26
-#define I2S_LRC 25
-#define I2S_DOUT 22
-#define BTN_VOL_UP GPIO_NUM_33
-#define BTN_VOL_DN GPIO_NUM_27
-#define LED_PIN 2
-
 class LazyShuffler
 {
 public:
@@ -66,7 +55,6 @@ public:
         : start(start), end(end), total(end - start + 1), remaining(total)
     {
     }
-
     int next()
     {
         if (remaining == 0)
@@ -75,30 +63,25 @@ public:
             used.clear();
             history.clear();
         }
-
         int val;
         do
         {
             val = start + esp_random() % total;
         } while (used.find(val) != used.end());
-
         used.insert(val);
         history.push_back(val);
         remaining--;
         return val;
     }
-
     int last()
     {
         if (history.size() < 2)
             return -1;
-        // Remove the latest number
         used.erase(history.back());
         history.pop_back();
         int prev = history.back();
         return prev;
     }
-
 private:
     int start, end, total, remaining;
     std::unordered_set<int> used;
@@ -125,15 +108,10 @@ LazyShuffler shuffler(0, 0);
 bool lockLoop = false;
 unsigned long lastSkip = 0;
 
-// fixed volume steps
-const float volSteps[] = {
-    0.02f, 0.03f, 0.04f, 0.05f,
-    0.10f, 0.15f, 0.20f, 0.25f,
-    0.30f, 0.40f, 0.50f, 0.60f,
-    0.70f, 0.80f, 0.90f, 1.00f};
-const int VOL_COUNT = sizeof(volSteps) / sizeof(volSteps[0]);
-
-int volIndex = 7; // start at 0.05 (index 3)
+// fixed gain
+const float volSteps[] = { 0.05f };
+const int VOL_COUNT = 1;
+int volIndex = 0; // Always 0
 
 QueueHandle_t bookmarkQueue;
 File bookmarkFile;
@@ -141,14 +119,12 @@ File bookmarkFile;
 bool writeIndexFile()
 {
     xSemaphoreTake(sdMutex, portMAX_DELAY);
-
     if (SD.exists("/index"))
     {
         LOGLN("Index found");
         xSemaphoreGive(sdMutex);
         return true;
     }
-
     File indexFile = SD.open("/index", FILE_WRITE);
     if (!indexFile)
     {
@@ -156,8 +132,6 @@ bool writeIndexFile()
         xSemaphoreGive(sdMutex);
         return false;
     }
-
-    // Helper lambda to recursively walk and write file paths
     std::function<void(File, String)> writePaths;
     int fileCount = 0;
     writePaths = [&](File dir, String path)
@@ -167,7 +141,6 @@ bool writeIndexFile()
             if (f.isDirectory())
             {
                 String folder = path + "/" + f.name();
-                // Skip folders that start with '.'
                 if (!String(f.name()).startsWith("."))
                 {
                     writePaths(f, folder);
@@ -188,15 +161,12 @@ bool writeIndexFile()
             f.close();
         }
     };
-
-    // Write all file paths (unsorted) to the index file
     File root = SD.open("/");
     writePaths(root, "");
     root.close();
     indexFile.flush();
     indexFile.close();
     delay(1000);
-
     if (fileCount == 0)
     {
         SD.remove("/index");
@@ -204,7 +174,6 @@ bool writeIndexFile()
         xSemaphoreGive(sdMutex);
         return false;
     }
-
     LOGLN("Index file created");
     xSemaphoreGive(sdMutex);
     totalFiles = fileCount;
@@ -223,15 +192,12 @@ void blinkLed(int times)
         }
         blinkTaskHandle = NULL;
     }
-
     int *blinkCount = new int(times);
-
     xTaskCreate(
         [](void *param)
         {
             int times = *(int *)param;
             delete (int *)param;
-
             for (int i = 0; i < times; i++)
             {
                 digitalWrite(LED_PIN, HIGH);
@@ -247,18 +213,12 @@ void blinkLed(int times)
 
 void blinkWelcomeMessage()
 {
-    // Morse code for "HELLO THERE"
-    // H: ....  E: .  L: .-..  L: .-..  O: ---
-    // T: -  H: ....  E: .  R: .-.  E: .
     const char *morse = ".... . .-.. .-.. ---   - .... . .-. .";
-    // Timing: dot=1, dash=3, intra-char=1, inter-char=3, inter-word=7 units
-    // We'll use 100ms as one unit
     const int dotLen = 10;
     const int dashLen = 3 * dotLen;
     const int intraCharGap = dotLen;
     const int interCharGap = 3 * dotLen;
     const int interWordGap = 7 * dotLen;
-
     if (blinkTaskHandle != NULL)
     {
         if (eTaskGetState(blinkTaskHandle) != eDeleted)
@@ -267,7 +227,6 @@ void blinkWelcomeMessage()
         }
         blinkTaskHandle = NULL;
     }
-
     xTaskCreate(
         [](void *param)
         {
@@ -290,7 +249,6 @@ void blinkWelcomeMessage()
                 }
                 else if (*p == ' ')
                 {
-                    // Check for triple space (word gap)
                     if (*(p + 1) == ' ' && *(p + 2) == ' ')
                     {
                         vTaskDelay((interWordGap - intraCharGap) / portTICK_PERIOD_MS);
@@ -341,19 +299,16 @@ uint32_t skipID3v2Tag(AudioFileSource *src)
     char header[10];
     if (src->read((uint8_t *)header, 10) != 10)
         return 0;
-
     if (memcmp(header, "ID3", 3) != 0)
     {
         src->seek(0, SEEK_SET); // not an ID3v2 tag
         return 0;
     }
-
     uint32_t tagSize =
         ((header[6] & 0x7F) << 21) |
         ((header[7] & 0x7F) << 14) |
         ((header[8] & 0x7F) << 7) |
         (header[9] & 0x7F);
-
     uint32_t skipBytes = tagSize + 10; // +10 header
     src->seek(skipBytes, SEEK_SET);
     return skipBytes;
@@ -362,47 +317,17 @@ uint32_t skipID3v2Tag(AudioFileSource *src)
 void playTrack(int idx, uint32_t off)
 {
     LOG("playTrack() called with idx=%d\n", idx);
-
     if (idx < 0 || idx >= totalFiles)
     {
         LOG("Invalid track index: %d\n", idx);
         return;
     }
-
     String currentPath;
-
     LOGLN("Opening index file for reading path");
     xSemaphoreTake(sdMutex, portMAX_DELAY);
-
     lockLoop = true;
     xQueueReset(bookmarkQueue);
-
-    // Stop any running decoder and cleanup
-    if (mp3 && mp3->isRunning())
-    {
-        mp3->stop();
-        delete mp3;
-        mp3 = nullptr;
-    }
-    if (wav && wav->isRunning())
-    {
-        wav->stop();
-        delete wav;
-        wav = nullptr;
-    }
-    if (flac && flac->isRunning())
-    {
-        flac->stop();
-        delete flac;
-        flac = nullptr;
-    }
-    if (fileSrc)
-    {
-        fileSrc->close();
-        delete fileSrc;
-        fileSrc = nullptr;
-    }
-
+    stopPlayback();
     File indexFile = SD.open("/index", FILE_READ);
     if (indexFile)
     {
@@ -421,9 +346,7 @@ void playTrack(int idx, uint32_t off)
         lockLoop = false;
         return;
     }
-
     xSemaphoreTake(sdMutex, portMAX_DELAY);
-
     fileSrc = new AudioFileSourceSD();
     if (currentPath.isEmpty() || !fileSrc->open(currentPath.c_str()))
     {
@@ -434,16 +357,18 @@ void playTrack(int idx, uint32_t off)
         lockLoop = false;
         return;
     }
-
     // Ensure audioOut is allocated
     if (!audioOut)
     {
         audioOut = new AudioOutputI2S();
         audioOut->SetPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
         audioOut->begin();
-        audioOut->SetGain(volSteps[volIndex]);
+        audioOut->SetGain(0.05f); // fixed gain
     }
-
+    else
+    {
+        audioOut->SetGain(0.05f); // fixed gain
+    }
     if (currentPath.endsWith(".mp3") || currentPath.endsWith(".MP3"))
     {
         currentIdx = idx;
@@ -494,18 +419,17 @@ void bookmarkTask(void *pv)
         {
             if (!bookmarkFile)
                 continue;
-
             xSemaphoreTake(sdMutex, portMAX_DELAY);
             bookmarkFile.seek(0);
-            // Save: currentIdx, pos, currentMode, currentFolderIdx
-            bookmarkFile.printf("%d %d %u %d\n", totalFiles, currentIdx, pos, volIndex);
+            // Save: currentIdx, pos, ledMode
+            bookmarkFile.printf("%d %d %u %d\n", totalFiles, currentIdx, pos, ledMode);
             bookmarkFile.flush();
             xSemaphoreGive(sdMutex);
         }
     }
 }
 
-bool readBookmark(int &idx, uint32_t &off, int &files, int &vol)
+bool readBookmark(int &idx, uint32_t &off, int &files, uint8_t &ledMode)
 {
     xSemaphoreTake(sdMutex, portMAX_DELAY);
     if (!SD.exists("/bookmark"))
@@ -513,40 +437,33 @@ bool readBookmark(int &idx, uint32_t &off, int &files, int &vol)
         xSemaphoreGive(sdMutex);
         return false;
     }
-
     File f = SD.open("/bookmark", FILE_READ);
     if (!f)
     {
         xSemaphoreGive(sdMutex);
         return false;
     }
-
     String line = f.readStringUntil('\n');
     f.close();
     xSemaphoreGive(sdMutex);
-
-    int read = sscanf(line.c_str(), "%d %d %u %d", &files, &idx, &off, &vol);
-
+    int read = sscanf(line.c_str(), "%d %d %u %hhu", &files, &idx, &off, &ledMode);
     return true;
 }
 
 void nextTrack()
 {
     LOGLN("nextTrack() called");
-
     int next = shuffler.next();
     if (currentIdx == next)
     {
         next = shuffler.next();
     }
-
     playTrack(next, 0);
 }
 
 void previousTrack()
 {
     LOGLN("previousTrack() called");
-
     unsigned long now = millis();
     if (now - lastSkip > 5000)
     {
@@ -568,110 +485,30 @@ void previousTrack()
     lastSkip = now;
 }
 
-static void volumeDown()
-{
-    if (volIndex > 0 && audioOut)
-    {
-        volIndex--;
-        audioOut->SetGain(volSteps[volIndex]);
-        blinkLed(1);
-        LOG("Vol: %.2f\n", volSteps[volIndex]);
-    }
-}
-
-static void volumeUp()
-{
-    if (volIndex < VOL_COUNT - 1 && audioOut)
-    {
-        volIndex++;
-        audioOut->SetGain(volSteps[volIndex]);
-        blinkLed(1);
-        LOG("Vol: %.2f\n", volSteps[volIndex]);
-    }
-}
-
 static void onVolumeUpButtonSingleClick(void *button_handle, void *user_data)
 {
-    volumeUp();
+    nextTrack();
 }
 
 static void onVolumeDownButtonSingleClick(void *button_handle, void *user_data)
 {
-    volumeDown();
+    previousTrack();
 }
 
-bool volume_up_button_hold = false;
-bool volume_down_button_hold = false;
-
-static void onVolumeUpButtonPressDown(void *button_handle, void *user_data)
+static void onModeButtonSingleClick(void *button_handle, void *user_data)
 {
-    volume_up_button_hold = true;
-}
-
-static void onVolumeUpButtonPressUp(void *button_handle, void *user_data)
-{
-    volume_up_button_hold = false;
-}
-
-static void onVolumeDownButtonPressDown(void *button_handle, void *user_data)
-{
-    volume_down_button_hold = true;
-}
-
-static void onVolumeDownButtonPressUp(void *button_handle, void *user_data)
-{
-    volume_down_button_hold = false;
-}
-
-static void onVolumeUpButtonLongPressStart(void *button_handle, void *user_data)
-{
-    if (volume_down_button_hold)
-    {
-        xSemaphoreTake(sdMutex, portMAX_DELAY);
-        SD.remove("/bookmark");
-        SD.remove("/index");
-        xSemaphoreGive(sdMutex);
-        blinkLed(50);
-        LOGLN("Bookmark and index deleted");
-        esp_restart();
-    }
-    else
-    {
-        nextTrack();
-    }
-}
-
-static void onVolumeDownButtonLongPressStart(void *button_handle, void *user_data)
-{
-    if (volume_up_button_hold)
-    {
-        xSemaphoreTake(sdMutex, portMAX_DELAY);
-        SD.remove("/bookmark");
-        SD.remove("/index");
-        xSemaphoreGive(sdMutex);
-        LOGLN("Bookmark and index deleted");
-        esp_restart();
-    }
-    else
-    {
-        previousTrack();
-    }
+    ledMode = (ledMode + 1) % 4;
+    updateNeoPixel();
 }
 
 void setup()
 {
-    // WiFi.mode(WIFI_OFF);
-    // btStop();
-    // srand(millis() ^ touchRead(T0));
     blinkWelcomeMessage();
 #if SERIAL_OUTPUT
     Serial.begin(115200);
-    while (!Serial)
-    {
-    }
+    while (!Serial) {}
     LOGLN("\n=== MP3 Shuffle w/ No-Stutter Bookmark ===");
 #endif
-
     sdMutex = xSemaphoreCreateMutex();
     if (sdMutex == NULL)
     {
@@ -679,7 +516,6 @@ void setup()
         while (true)
             delay(1000);
     }
-
     if (!SD.begin(SD_CS))
     {
         LOGLN("SD init failed");
@@ -687,55 +523,45 @@ void setup()
             delay(1000);
     }
     LOGLN("SD OK");
-
+    strip.begin();
+    strip.show();
     if (!audioOut)
     {
         audioOut = new AudioOutputI2S();
         audioOut->SetPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
         audioOut->begin();
-        LOGLN("I²S OK");
+        audioOut->SetGain(0.05f);
     }
-
     if (!writeIndexFile())
     {
         LOGLN("No MP3s");
         while (1)
             delay(1000);
     }
-
     int idx = 0;
     uint32_t off = 0;
     int total = totalFiles;
-    int vol = volIndex;
-    bool bookmarkFound = readBookmark(idx, off, total, vol);
+    uint8_t ledModeTmp = 0;
+    bool bookmarkFound = readBookmark(idx, off, total, ledModeTmp);
+    ledMode = ledModeTmp;
+    updateNeoPixel();
     LOGLN(bookmarkFound ? "Bookmark file opened" : "No bookmark found");
-
     if (total <= 0)
         LOGLN("No files found.");
-
     while (total <= 0)
         delay(100);
-
     totalFiles = total;
-
-    volIndex = vol;
-    if (audioOut)
-        audioOut->SetGain(volSteps[volIndex]);
-
     shuffler = LazyShuffler(0, totalFiles - 1);
-
     bookmarkFile = SD.open("/bookmark", FILE_WRITE);
     if (!bookmarkFile)
     {
         LOGLN("Failed to open bookmark for writing");
     }
-
     bookmarkQueue = xQueueCreate(5, sizeof(uint32_t));
     xTaskCreatePinnedToCore(bookmarkTask, "bookmarkTask", 4096, NULL, 2, NULL, 1);
-
     if (bookmarkFound)
     {
-        LOG("Bookmark: %d %u %u\n", idx, off, total, vol);
+        LOG("Bookmark: %d %u %u %u\n", idx, off, total, ledMode);
         LOG("Resume track %d @ byte %u\n", idx, off);
         playTrack(idx, off);
     }
@@ -743,33 +569,24 @@ void setup()
     {
         playTrack(shuffler.next(), 0);
     }
-
     pinMode(LED_PIN, OUTPUT);
     digitalWrite(LED_PIN, LOW); // LED off by default
-
     Button *volUpBtn = new Button(BTN_VOL_UP, false);
     volUpBtn->attachSingleClickEventCb(onVolumeUpButtonSingleClick, NULL);
-    volUpBtn->attachPressDownEventCb(onVolumeUpButtonPressDown, NULL);
-    volUpBtn->attachPressUpEventCb(onVolumeUpButtonPressUp, NULL);
-    volUpBtn->attachLongPressStartEventCb(onVolumeUpButtonLongPressStart, NULL);
-
     Button *volDnBtn = new Button(BTN_VOL_DN, false);
     volDnBtn->attachSingleClickEventCb(onVolumeDownButtonSingleClick, NULL);
-    volDnBtn->attachPressDownEventCb(onVolumeDownButtonPressDown, NULL);
-    volDnBtn->attachPressUpEventCb(onVolumeDownButtonPressUp, NULL);
-    volDnBtn->attachLongPressStartEventCb(onVolumeDownButtonLongPressStart, NULL);
+    Button *modeBtn = new Button(BTN_MODE, false);
+    modeBtn->attachSingleClickEventCb(onModeButtonSingleClick, NULL);
 }
 
 void loop()
 {
     unsigned long now = millis();
-
     if (lockLoop)
     {
         LOGLN("Loop locked.");
         return;
     }
-
     bool active = false;
     xSemaphoreTake(sdMutex, portMAX_DELAY);
     switch (currentType)
@@ -791,7 +608,6 @@ void loop()
         break;
     }
     xSemaphoreGive(sdMutex);
-
     if (!active)
     {
         LOGLN("track finished, playing next");
