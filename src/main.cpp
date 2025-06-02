@@ -108,11 +108,6 @@ LazyShuffler shuffler(0, 0);
 bool lockLoop = false;
 unsigned long lastSkip = 0;
 
-// fixed gain
-const float volSteps[] = { 0.05f };
-const int VOL_COUNT = 1;
-int volIndex = 0; // Always 0
-
 QueueHandle_t bookmarkQueue;
 File bookmarkFile;
 
@@ -363,11 +358,9 @@ void playTrack(int idx, uint32_t off)
         audioOut = new AudioOutputI2S();
         audioOut->SetPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
         audioOut->begin();
-        audioOut->SetGain(0.05f); // fixed gain
     }
     else
     {
-        audioOut->SetGain(0.05f); // fixed gain
     }
     if (currentPath.endsWith(".mp3") || currentPath.endsWith(".MP3"))
     {
@@ -530,7 +523,6 @@ void setup()
         audioOut = new AudioOutputI2S();
         audioOut->SetPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
         audioOut->begin();
-        audioOut->SetGain(0.05f);
     }
     if (!writeIndexFile())
     {
