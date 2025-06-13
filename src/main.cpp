@@ -13,6 +13,8 @@ extern "C" {
 #define I2S_DOUT 22
 #define FLAC_READ_BUFFER_SIZE 4096
 #define FLAC_MAX_CHANNELS 8
+#define I2S_DMA_BUF_COUNT 8
+#define I2S_DMA_BUF_LEN 256*2
 
 File flacFile;
 miniflac_t* decoder = nullptr;
@@ -50,7 +52,7 @@ String findFirstFlacFile(File dir) {
 }
 
 void setup() {
-    Serial.begin(115200);
+    Serial.begin(115150);
     Serial.println("Starting setup...");
     if (!SD.begin(SD_CS)) {
         Serial.println("SD Card initialization failed!");
@@ -79,8 +81,8 @@ void setup() {
         .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
         .communication_format = I2S_COMM_FORMAT_STAND_I2S,
         .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-        .dma_buf_count = 4,
-        .dma_buf_len = 64,
+        .dma_buf_count = I2S_DMA_BUF_COUNT,
+        .dma_buf_len = I2S_DMA_BUF_LEN,
         .use_apll = false,
         .tx_desc_auto_clear = true,
         .fixed_mclk = 0
@@ -167,8 +169,8 @@ void setup() {
                     return;
                 }
             }
-            i2sBufferSize = blockSize * channels * 4;
             if (i2sBuffer) free(i2sBuffer);
+            i2sBufferSize = blockSize * channels * 4;
             i2sBuffer = (uint8_t*)malloc(i2sBufferSize);
             if (!i2sBuffer) {
                 Serial.println("Failed to allocate I2S buffer!");
@@ -195,6 +197,67 @@ void setup() {
     if (!streaminfoFound) {
         Serial.println("STREAMINFO block not found!");
         return;
+    }
+    // Pre-fill I2S buffer
+    i2sBufferSize = 0;
+    for (int i = 0; i < I2S_DMA_BUF_COUNT; ++i) {
+        uint32_t used2 = 0;
+        int res = miniflac_decode(decoder, &readBuffer[readBufferPos], readBufferLen - readBufferPos, &used2, pcm);
+        readBufferPos += used2;
+        if (res == MINIFLAC_OK) {
+            size_t blocksize = decoder->frame.header.block_size;
+            uint8_t ch = decoder->frame.header.channels;
+            uint8_t bits = decoder->frame.header.bps;
+            size_t outLen = 0;
+            if (bits <= 8) {
+                for (size_t j = 0; j < blocksize; ++j) {
+                    for (uint8_t c = 0; c < ch; ++c) {
+                        i2sBuffer[outLen++] = (uint8_t)(pcm[c][j] << (8 - bits));
+                    }
+                }
+            } else if (bits <= 16) {
+                for (size_t j = 0; j < blocksize; ++j) {
+                    for (uint8_t c = 0; c < ch; ++c) {
+                        int16_t sample = (int16_t)(pcm[c][j] << (16 - bits));
+                        i2sBuffer[outLen++] = sample & 0xFF;
+                        i2sBuffer[outLen++] = (sample >> 8) & 0xFF;
+                    }
+                }
+            } else if (bits <= 24) {
+                for (size_t j = 0; j < blocksize; ++j) {
+                    for (uint8_t c = 0; c < ch; ++c) {
+                        int32_t sample = pcm[c][j] << (24 - bits);
+                        i2sBuffer[outLen++] = sample & 0xFF;
+                        i2sBuffer[outLen++] = (sample >> 8) & 0xFF;
+                        i2sBuffer[outLen++] = (sample >> 16) & 0xFF;
+                    }
+                }
+            } else if (bits <= 32) {
+                for (size_t j = 0; j < blocksize; ++j) {
+                    for (uint8_t c = 0; c < ch; ++c) {
+                        int32_t sample = pcm[c][j];
+                        i2sBuffer[outLen++] = sample & 0xFF;
+                        i2sBuffer[outLen++] = (sample >> 8) & 0xFF;
+                        i2sBuffer[outLen++] = (sample >> 16) & 0xFF;
+                        i2sBuffer[outLen++] = (sample >> 24) & 0xFF;
+                    }
+                }
+            }
+            i2sBufferSize = outLen;
+            // Sync to next frame for next buffer
+            if (miniflac_sync(decoder, &readBuffer[readBufferPos], readBufferLen - readBufferPos, &used2) != MINIFLAC_OK) {
+                if (flacFile.available()) {
+                    readBufferLen = flacFile.read(readBuffer, FLAC_READ_BUFFER_SIZE);
+                    readBufferPos = 0;
+                } else {
+                    Serial.println("End of file or read error");
+                    active = false;
+                    return;
+                }
+            } else {
+                readBufferPos += used2;
+            }
+        }
     }
     active = true;
 }
