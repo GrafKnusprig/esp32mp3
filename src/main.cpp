@@ -1,629 +1,281 @@
-// FreeRTOS includes in correct order
-#include <freertos/FreeRTOS.h>
-#include <freertos/semphr.h>
-#include <freertos/task.h>
-SemaphoreHandle_t sdMutex;
-#include <vector>
+#define MINIFLAC_IMPLEMENTATION
+extern "C" {
+#include "../lib/miniflac/miniflac.h"
+}
+#include <Arduino.h>
 #include <SD.h>
-#include <AudioFileSourceSD.h>
-#include <AudioGeneratorMP3.h>
-#include <AudioGeneratorWAV.h>
-#include <AudioGeneratorFLAC.h>
-#include <AudioOutputI2S.h>
-#include "esp_system.h"
-#include <freertos/queue.h>
-#include <WiFi.h>
-#include <unordered_set>
-#include <Button.h>
-#include <Adafruit_NeoPixel.h>
+#include <SPI.h>
+#include <driver/i2s.h>
 
-// Pin definitions
 #define SD_CS 5
 #define I2S_BCLK 26
 #define I2S_LRC 25
 #define I2S_DOUT 22
-#define BTN_VOL_UP GPIO_NUM_33
-#define BTN_VOL_DN GPIO_NUM_27
-#define BTN_MODE   GPIO_NUM_32
-#define LED_PIN 2
-#define NEOPIXEL_PIN 21
-#define NEOPIXEL_COUNT 1
+#define FLAC_READ_BUFFER_SIZE 4096
+#define FLAC_MAX_CHANNELS 8
 
-// NeoPixel setup
-Adafruit_NeoPixel strip(NEOPIXEL_COUNT, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
-uint8_t ledMode = 0; // 0=OFF, 1=RED, 2=GREEN, 3=BLUE
-const uint32_t ledColors[] = {0x000000, 0xFF0000, 0x00FF00, 0x0000FF};
-void updateNeoPixel() {
-    strip.setPixelColor(0, ledColors[ledMode]);
-    strip.show();
-}
+File flacFile;
+miniflac_t* decoder = nullptr;
+uint8_t* readBuffer = nullptr;
+size_t readBufferLen = 0;
+size_t readBufferPos = 0;
+int32_t* pcm[FLAC_MAX_CHANNELS] = {nullptr};
+uint8_t* i2sBuffer = nullptr;
+size_t i2sBufferSize = 0;
+uint32_t sampleRate = 0;
+uint8_t channels = 0;
+uint8_t bps = 0;
+uint16_t blockSize = 0;
+bool active = false;
 
-// Serial logging
-#define SERIAL_OUTPUT 1
-#if SERIAL_OUTPUT
-#define LOG(...) Serial.printf(__VA_ARGS__)
-#define LOGLN(...) Serial.println(__VA_ARGS__)
-#else
-#define LOG(...) (void)0
-#define LOGLN(...) (void)0
-#endif
-
-class LazyShuffler
-{
-public:
-    LazyShuffler(int start, int end)
-        : start(start), end(end), total(end - start + 1), remaining(total)
-    {
-    }
-    int next()
-    {
-        if (remaining == 0)
-        {
-            remaining = total;
-            used.clear();
-            history.clear();
-        }
-        int val;
-        do
-        {
-            val = start + esp_random() % total;
-        } while (used.find(val) != used.end());
-        used.insert(val);
-        history.push_back(val);
-        remaining--;
-        return val;
-    }
-    int last()
-    {
-        if (history.size() < 2)
-            return -1;
-        used.erase(history.back());
-        history.pop_back();
-        int prev = history.back();
-        return prev;
-    }
-private:
-    int start, end, total, remaining;
-    std::unordered_set<int> used;
-    std::vector<int> history;
-};
-
-AudioFileSourceSD *fileSrc = nullptr;
-AudioGeneratorMP3 *mp3 = nullptr;
-AudioGeneratorWAV *wav = nullptr;
-AudioGeneratorFLAC *flac = nullptr;
-AudioOutputI2S *audioOut = nullptr;
-enum AudioType
-{
-    TYPE_MP3,
-    TYPE_WAV,
-    TYPE_FLAC,
-    TYPE_UNKNOWN
-};
-AudioType currentType = TYPE_UNKNOWN;
-int totalFiles = -1;
-int currentIdx = -1;
-unsigned long lastBookmarkMs = 0;
-LazyShuffler shuffler(0, 0);
-bool lockLoop = false;
-unsigned long lastSkip = 0;
-
-QueueHandle_t bookmarkQueue;
-File bookmarkFile;
-
-bool writeIndexFile()
-{
-    xSemaphoreTake(sdMutex, portMAX_DELAY);
-    if (SD.exists("/index"))
-    {
-        LOGLN("Index found");
-        xSemaphoreGive(sdMutex);
-        return true;
-    }
-    File indexFile = SD.open("/index", FILE_WRITE);
-    if (!indexFile)
-    {
-        LOGLN("Failed to create index file");
-        xSemaphoreGive(sdMutex);
-        return false;
-    }
-    std::function<void(File, String)> writePaths;
-    int fileCount = 0;
-    writePaths = [&](File dir, String path)
-    {
-        while (File f = dir.openNextFile())
-        {
-            if (f.isDirectory())
-            {
-                String folder = path + "/" + f.name();
-                if (!String(f.name()).startsWith("."))
-                {
-                    writePaths(f, folder);
-                }
+String findFirstFlacFile(File dir) {
+    while (File entry = dir.openNextFile()) {
+        if (entry.isDirectory()) {
+            String found = findFirstFlacFile(entry);
+            entry.close();
+            if (found != "") {
+                return found;
             }
-            else
-            {
-                String n = f.name();
-                if (n.endsWith(".mp3") || n.endsWith(".MP3") ||
-                    n.endsWith(".wav") || n.endsWith(".WAV") ||
-                    n.endsWith(".flac") || n.endsWith(".FLAC"))
-                {
-                    String fullPath = path + "/" + n;
-                    indexFile.println(fullPath);
-                    fileCount++;
-                }
+        } else {
+            String name = entry.name();
+            if (name.endsWith(".flac") || name.endsWith(".FLAC")) {
+                String path = String(entry.path());
+                entry.close();
+                return path;
             }
-            f.close();
         }
-    };
-    File root = SD.open("/");
-    writePaths(root, "");
-    root.close();
-    indexFile.flush();
-    indexFile.close();
-    delay(1000);
-    if (fileCount == 0)
-    {
-        SD.remove("/index");
-        LOGLN("No audio files found for index.");
-        xSemaphoreGive(sdMutex);
-        return false;
+        entry.close();
     }
-    LOGLN("Index file created");
-    xSemaphoreGive(sdMutex);
-    totalFiles = fileCount;
-    LOG("Total files: %d\n", totalFiles);
-    return true;
+    return "";
 }
 
-TaskHandle_t blinkTaskHandle = NULL;
-void blinkLed(int times)
-{
-    if (blinkTaskHandle != NULL)
-    {
-        if (eTaskGetState(blinkTaskHandle) != eDeleted)
-        {
-            vTaskDelete(blinkTaskHandle);
-        }
-        blinkTaskHandle = NULL;
-    }
-    int *blinkCount = new int(times);
-    xTaskCreate(
-        [](void *param)
-        {
-            int times = *(int *)param;
-            delete (int *)param;
-            for (int i = 0; i < times; i++)
-            {
-                digitalWrite(LED_PIN, HIGH);
-                vTaskDelay(40 / portTICK_PERIOD_MS);
-                digitalWrite(LED_PIN, LOW);
-                vTaskDelay(40 / portTICK_PERIOD_MS);
-            }
-            vTaskDelete(NULL);
-            vTaskDelay(1);
-        },
-        "blinkTask", 1024, blinkCount, 1, &blinkTaskHandle);
-}
-
-void blinkWelcomeMessage()
-{
-    const char *morse = ".... . .-.. .-.. ---   - .... . .-. .";
-    const int dotLen = 10;
-    const int dashLen = 3 * dotLen;
-    const int intraCharGap = dotLen;
-    const int interCharGap = 3 * dotLen;
-    const int interWordGap = 7 * dotLen;
-    if (blinkTaskHandle != NULL)
-    {
-        if (eTaskGetState(blinkTaskHandle) != eDeleted)
-        {
-            vTaskDelete(blinkTaskHandle);
-        }
-        blinkTaskHandle = NULL;
-    }
-    xTaskCreate(
-        [](void *param)
-        {
-            const char *morse = (const char *)param;
-            for (const char *p = morse; *p; ++p)
-            {
-                if (*p == '.')
-                {
-                    digitalWrite(LED_PIN, HIGH);
-                    vTaskDelay(dotLen / portTICK_PERIOD_MS);
-                    digitalWrite(LED_PIN, LOW);
-                    vTaskDelay(intraCharGap / portTICK_PERIOD_MS);
-                }
-                else if (*p == '-')
-                {
-                    digitalWrite(LED_PIN, HIGH);
-                    vTaskDelay(dashLen / portTICK_PERIOD_MS);
-                    digitalWrite(LED_PIN, LOW);
-                    vTaskDelay(intraCharGap / portTICK_PERIOD_MS);
-                }
-                else if (*p == ' ')
-                {
-                    if (*(p + 1) == ' ' && *(p + 2) == ' ')
-                    {
-                        vTaskDelay((interWordGap - intraCharGap) / portTICK_PERIOD_MS);
-                        p += 2;
-                    }
-                    else
-                    {
-                        vTaskDelay((interCharGap - intraCharGap) / portTICK_PERIOD_MS);
-                    }
-                }
-            }
-            vTaskDelete(NULL);
-            vTaskDelay(1);
-        },
-        "morseBlink", 1024, (void *)morse, 1, &blinkTaskHandle);
-}
-
-void stopPlayback()
-{
-    if (mp3 && mp3->isRunning())
-    {
-        mp3->stop();
-        delete mp3;
-        mp3 = nullptr;
-    }
-    if (wav && wav->isRunning())
-    {
-        wav->stop();
-        delete wav;
-        wav = nullptr;
-    }
-    if (flac && flac->isRunning())
-    {
-        flac->stop();
-        delete flac;
-        flac = nullptr;
-    }
-    if (fileSrc)
-    {
-        fileSrc->close();
-        delete fileSrc;
-        fileSrc = nullptr;
-    }
-}
-
-uint32_t skipID3v2Tag(AudioFileSource *src)
-{
-    char header[10];
-    if (src->read((uint8_t *)header, 10) != 10)
-        return 0;
-    if (memcmp(header, "ID3", 3) != 0)
-    {
-        src->seek(0, SEEK_SET); // not an ID3v2 tag
-        return 0;
-    }
-    uint32_t tagSize =
-        ((header[6] & 0x7F) << 21) |
-        ((header[7] & 0x7F) << 14) |
-        ((header[8] & 0x7F) << 7) |
-        (header[9] & 0x7F);
-    uint32_t skipBytes = tagSize + 10; // +10 header
-    src->seek(skipBytes, SEEK_SET);
-    return skipBytes;
-}
-
-void playTrack(int idx, uint32_t off)
-{
-    LOG("playTrack() called with idx=%d\n", idx);
-    if (idx < 0 || idx >= totalFiles)
-    {
-        LOG("Invalid track index: %d\n", idx);
-        return;
-    }
-    String currentPath;
-    LOGLN("Opening index file for reading path");
-    xSemaphoreTake(sdMutex, portMAX_DELAY);
-    lockLoop = true;
-    xQueueReset(bookmarkQueue);
-    stopPlayback();
-    File indexFile = SD.open("/index", FILE_READ);
-    if (indexFile)
-    {
-        for (int i = 0; i <= idx; ++i)
-        {
-            currentPath = indexFile.readStringUntil('\n');
-        }
-        indexFile.close();
-        currentPath.trim();
-        xSemaphoreGive(sdMutex);
-    }
-    else
-    {
-        LOGLN("Failed to open /index for reading path");
-        xSemaphoreGive(sdMutex);
-        lockLoop = false;
-        return;
-    }
-    xSemaphoreTake(sdMutex, portMAX_DELAY);
-    fileSrc = new AudioFileSourceSD();
-    if (currentPath.isEmpty() || !fileSrc->open(currentPath.c_str()))
-    {
-        LOGLN("file open failed");
-        delete fileSrc;
-        fileSrc = nullptr;
-        xSemaphoreGive(sdMutex);
-        lockLoop = false;
-        return;
-    }
-    // Ensure audioOut is allocated
-    if (!audioOut)
-    {
-        audioOut = new AudioOutputI2S();
-        audioOut->SetPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
-        audioOut->begin();
-    }
-    else
-    {
-    }
-    if (currentPath.endsWith(".mp3") || currentPath.endsWith(".MP3"))
-    {
-        currentIdx = idx;
-        currentType = TYPE_MP3;
-        if (off == 0)
-        {
-            uint32_t skipped = skipID3v2Tag(fileSrc);
-            LOG("Skipped %u bytes of ID3v2 tag\n", skipped);
-        }
-        else
-        {
-            fileSrc->seek(off, SEEK_SET);
-        }
-        mp3 = new AudioGeneratorMP3();
-        mp3->begin(fileSrc, audioOut);
-    }
-    else if (currentPath.endsWith(".wav") || currentPath.endsWith(".WAV"))
-    {
-        currentIdx = idx;
-        currentType = TYPE_WAV;
-        wav = new AudioGeneratorWAV();
-        wav->begin(fileSrc, audioOut);
-    }
-    else if (currentPath.endsWith(".flac") || currentPath.endsWith(".FLAC"))
-    {
-        currentIdx = idx;
-        currentType = TYPE_FLAC;
-        fileSrc->seek(off, SEEK_SET);
-        flac = new AudioGeneratorFLAC();
-        flac->begin(fileSrc, audioOut);
-    }
-    else
-    {
-        currentType = TYPE_UNKNOWN;
-        LOGLN("unsupported file type");
-    }
-    lockLoop = false;
-    LOG("Playing %s\n", currentPath.c_str());
-    xSemaphoreGive(sdMutex);
-}
-
-void bookmarkTask(void *pv)
-{
-    uint32_t pos;
-    for (;;)
-    {
-        if (xQueueReceive(bookmarkQueue, &pos, portMAX_DELAY) == pdTRUE)
-        {
-            if (!bookmarkFile)
-                continue;
-            xSemaphoreTake(sdMutex, portMAX_DELAY);
-            bookmarkFile.seek(0);
-            // Save: currentIdx, pos, ledMode
-            bookmarkFile.printf("%d %d %u %d\n", totalFiles, currentIdx, pos, ledMode);
-            bookmarkFile.flush();
-            xSemaphoreGive(sdMutex);
-        }
-    }
-}
-
-bool readBookmark(int &idx, uint32_t &off, int &files, uint8_t &ledMode)
-{
-    xSemaphoreTake(sdMutex, portMAX_DELAY);
-    if (!SD.exists("/bookmark"))
-    {
-        xSemaphoreGive(sdMutex);
-        return false;
-    }
-    File f = SD.open("/bookmark", FILE_READ);
-    if (!f)
-    {
-        xSemaphoreGive(sdMutex);
-        return false;
-    }
-    String line = f.readStringUntil('\n');
-    f.close();
-    xSemaphoreGive(sdMutex);
-    int read = sscanf(line.c_str(), "%d %d %u %hhu", &files, &idx, &off, &ledMode);
-    return true;
-}
-
-void nextTrack()
-{
-    LOGLN("nextTrack() called");
-    int next = shuffler.next();
-    if (currentIdx == next)
-    {
-        next = shuffler.next();
-    }
-    playTrack(next, 0);
-}
-
-void previousTrack()
-{
-    LOGLN("previousTrack() called");
-    unsigned long now = millis();
-    if (now - lastSkip > 5000)
-    {
-        playTrack(currentIdx, 0);
-    }
-    else
-    {
-        int last = shuffler.last();
-        if (last < 0)
-        {
-            LOGLN("No previous track available");
-            playTrack(currentIdx, 0);
-        }
-        else
-        {
-            playTrack(last, 0);
-        }
-    }
-    lastSkip = now;
-}
-
-static void onVolumeUpButtonSingleClick(void *button_handle, void *user_data)
-{
-    nextTrack();
-}
-
-static void onVolumeDownButtonSingleClick(void *button_handle, void *user_data)
-{
-    previousTrack();
-}
-
-static void onModeButtonSingleClick(void *button_handle, void *user_data)
-{
-    ledMode = (ledMode + 1) % 4;
-    updateNeoPixel();
-}
-
-void setup()
-{
-    blinkWelcomeMessage();
-#if SERIAL_OUTPUT
+void setup() {
     Serial.begin(115200);
-    while (!Serial) {}
-    LOGLN("\n=== MP3 Shuffle w/ No-Stutter Bookmark ===");
-#endif
-    sdMutex = xSemaphoreCreateMutex();
-    if (sdMutex == NULL)
-    {
-        LOGLN("Failed to create sdMutex!");
-        while (true)
-            delay(1000);
+    Serial.println("Starting setup...");
+    if (!SD.begin(SD_CS)) {
+        Serial.println("SD Card initialization failed!");
+        return;
     }
-    if (!SD.begin(SD_CS))
-    {
-        LOGLN("SD init failed");
-        while (1)
-            delay(1000);
+    Serial.println("SD Card initialized successfully");
+    delay(1000);
+    Serial.println("Searching for first FLAC file...");
+    File root = SD.open("/");
+    if (!root || !root.isDirectory()) {
+        Serial.println("Failed to open root directory!");
+        return;
     }
-    LOGLN("SD OK");
-    strip.begin();
-    strip.show();
-    if (!audioOut)
-    {
-        audioOut = new AudioOutputI2S();
-        audioOut->SetPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
-        audioOut->begin();
+    String currentFile = findFirstFlacFile(root);
+    root.close();
+    if (currentFile == "") {
+        Serial.println("No FLAC file found on SD card!");
+        return;
     }
-    if (!writeIndexFile())
-    {
-        LOGLN("No MP3s");
-        while (1)
-            delay(1000);
+    Serial.printf("First FLAC file found: %s\n", currentFile.c_str());
+    Serial.println("Initializing I2S...");
+    i2s_config_t i2s_config = {
+        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
+        .sample_rate = 44100, // will update after STREAMINFO
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT, // will update after STREAMINFO
+        .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
+        .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+        .dma_buf_count = 4,
+        .dma_buf_len = 64,
+        .use_apll = false,
+        .tx_desc_auto_clear = true,
+        .fixed_mclk = 0
+    };
+    i2s_pin_config_t pin_config = {
+        .bck_io_num = I2S_BCLK,
+        .ws_io_num = I2S_LRC,
+        .data_out_num = I2S_DOUT,
+        .data_in_num = I2S_PIN_NO_CHANGE
+    };
+    if (i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL) != ESP_OK) {
+        Serial.println("Failed to install I2S driver!");
+        return;
     }
-    int idx = 0;
-    uint32_t off = 0;
-    int total = totalFiles;
-    uint8_t ledModeTmp = 0;
-    bool bookmarkFound = readBookmark(idx, off, total, ledModeTmp);
-    ledMode = ledModeTmp;
-    updateNeoPixel();
-    LOGLN(bookmarkFound ? "Bookmark file opened" : "No bookmark found");
-    if (total <= 0)
-        LOGLN("No files found.");
-    while (total <= 0)
-        delay(100);
-    totalFiles = total;
-    shuffler = LazyShuffler(0, totalFiles - 1);
-    bookmarkFile = SD.open("/bookmark", FILE_WRITE);
-    if (!bookmarkFile)
-    {
-        LOGLN("Failed to open bookmark for writing");
+    if (i2s_set_pin(I2S_NUM_0, &pin_config) != ESP_OK) {
+        Serial.println("Failed to set I2S pins!");
+        return;
     }
-    bookmarkQueue = xQueueCreate(5, sizeof(uint32_t));
-    xTaskCreatePinnedToCore(bookmarkTask, "bookmarkTask", 4096, NULL, 2, NULL, 1);
-    if (bookmarkFound)
-    {
-        LOG("Bookmark: %d %u %u %u\n", idx, off, total, ledMode);
-        LOG("Resume track %d @ byte %u\n", idx, off);
-        playTrack(idx, off);
+    Serial.println("I2S driver and pins configured successfully");
+    flacFile = SD.open(currentFile);
+    if (!flacFile) {
+        Serial.println("Failed to open FLAC file!");
+        return;
     }
-    else
-    {
-        playTrack(shuffler.next(), 0);
+    readBuffer = (uint8_t*)malloc(FLAC_READ_BUFFER_SIZE);
+    if (!readBuffer) {
+        Serial.println("Failed to allocate read buffer!");
+        return;
     }
-    pinMode(LED_PIN, OUTPUT);
-    digitalWrite(LED_PIN, LOW); // LED off by default
-    Button *volUpBtn = new Button(BTN_VOL_UP, false);
-    volUpBtn->attachSingleClickEventCb(onVolumeUpButtonSingleClick, NULL);
-    Button *volDnBtn = new Button(BTN_VOL_DN, false);
-    volDnBtn->attachSingleClickEventCb(onVolumeDownButtonSingleClick, NULL);
-    Button *modeBtn = new Button(BTN_MODE, false);
-    modeBtn->attachSingleClickEventCb(onModeButtonSingleClick, NULL);
+    decoder = (miniflac_t*)malloc(miniflac_size());
+    if (!decoder) {
+        Serial.println("Failed to allocate decoder!");
+        return;
+    }
+    miniflac_init(decoder, MINIFLAC_CONTAINER_UNKNOWN);
+    readBufferLen = flacFile.read(readBuffer, FLAC_READ_BUFFER_SIZE);
+    readBufferPos = 0;
+    uint32_t used = 0;
+    // Sync to first metadata block
+    if (miniflac_sync(decoder, &readBuffer[readBufferPos], readBufferLen - readBufferPos, &used) != MINIFLAC_OK) {
+        Serial.println("FLAC sync error!");
+        return;
+    }
+    readBufferPos += used;
+    // Parse metadata blocks, allocate buffers after STREAMINFO
+    bool streaminfoFound = false;
+    while (decoder->state == MINIFLAC_METADATA) {
+        if (decoder->metadata.header.type == MINIFLAC_METADATA_STREAMINFO) {
+            // Parse streaminfo
+            uint16_t min_block, max_block;
+            uint32_t min_frame, max_frame, sr;
+            uint8_t ch, bps_val;
+            uint64_t total_samples;
+            if (miniflac_streaminfo_min_block_size(decoder, &readBuffer[readBufferPos], readBufferLen - readBufferPos, &used, &min_block) != MINIFLAC_OK) return;
+            readBufferPos += used;
+            if (miniflac_streaminfo_max_block_size(decoder, &readBuffer[readBufferPos], readBufferLen - readBufferPos, &used, &max_block) != MINIFLAC_OK) return;
+            readBufferPos += used;
+            if (miniflac_streaminfo_min_frame_size(decoder, &readBuffer[readBufferPos], readBufferLen - readBufferPos, &used, &min_frame) != MINIFLAC_OK) return;
+            readBufferPos += used;
+            if (miniflac_streaminfo_max_frame_size(decoder, &readBuffer[readBufferPos], readBufferLen - readBufferPos, &used, &max_frame) != MINIFLAC_OK) return;
+            readBufferPos += used;
+            if (miniflac_streaminfo_sample_rate(decoder, &readBuffer[readBufferPos], readBufferLen - readBufferPos, &used, &sr) != MINIFLAC_OK) return;
+            readBufferPos += used;
+            if (miniflac_streaminfo_channels(decoder, &readBuffer[readBufferPos], readBufferLen - readBufferPos, &used, &ch) != MINIFLAC_OK) return;
+            readBufferPos += used;
+            if (miniflac_streaminfo_bps(decoder, &readBuffer[readBufferPos], readBufferLen - readBufferPos, &used, &bps_val) != MINIFLAC_OK) return;
+            readBufferPos += used;
+            if (miniflac_streaminfo_total_samples(decoder, &readBuffer[readBufferPos], readBufferLen - readBufferPos, &used, &total_samples) != MINIFLAC_OK) return;
+            readBufferPos += used;
+            sampleRate = sr;
+            channels = ch;
+            bps = bps_val;
+            blockSize = max_block;
+            Serial.printf("FLAC stream: %u Hz, %u ch, %u bps, blocksize %u\n", sampleRate, channels, bps, blockSize);
+            // (Re)allocate PCM and I2S buffers
+            for (int i = 0; i < FLAC_MAX_CHANNELS; ++i) {
+                if (pcm[i]) free(pcm[i]);
+                pcm[i] = nullptr;
+            }
+            for (int i = 0; i < channels; ++i) {
+                pcm[i] = (int32_t*)malloc(sizeof(int32_t) * blockSize);
+                if (!pcm[i]) {
+                    Serial.printf("Failed to allocate PCM buffer for channel %d!\n", i);
+                    return;
+                }
+            }
+            i2sBufferSize = blockSize * channels * 4;
+            if (i2sBuffer) free(i2sBuffer);
+            i2sBuffer = (uint8_t*)malloc(i2sBufferSize);
+            if (!i2sBuffer) {
+                Serial.println("Failed to allocate I2S buffer!");
+                return;
+            }
+            // Update I2S config
+            i2s_set_clk(I2S_NUM_0, sampleRate, (bps <= 16) ? I2S_BITS_PER_SAMPLE_16BIT : I2S_BITS_PER_SAMPLE_32BIT, (channels == 2) ? I2S_CHANNEL_STEREO : I2S_CHANNEL_MONO);
+            streaminfoFound = true;
+        }
+        // Skip rest of metadata block
+        if (miniflac_sync(decoder, &readBuffer[readBufferPos], readBufferLen - readBufferPos, &used) != MINIFLAC_OK) {
+            // If not enough data, refill buffer
+            if (flacFile.available()) {
+                readBufferLen = flacFile.read(readBuffer, FLAC_READ_BUFFER_SIZE);
+                readBufferPos = 0;
+            } else {
+                Serial.println("End of file or read error during metadata!");
+                return;
+            }
+        } else {
+            readBufferPos += used;
+        }
+    }
+    if (!streaminfoFound) {
+        Serial.println("STREAMINFO block not found!");
+        return;
+    }
+    active = true;
 }
 
-void loop()
-{
-    unsigned long now = millis();
-    if (lockLoop)
-    {
-        LOGLN("Loop locked.");
-        return;
-    }
-    bool active = false;
-    xSemaphoreTake(sdMutex, portMAX_DELAY);
-    switch (currentType)
-    {
-    case TYPE_MP3:
-        if (mp3)
-            active = mp3->isRunning() && mp3->loop();
-        break;
-    case TYPE_WAV:
-        if (wav)
-            active = wav->isRunning() && wav->loop();
-        break;
-    case TYPE_FLAC:
-        if (flac)
-            active = flac->isRunning() && flac->loop();
-        break;
-    default:
+void loop() {
+    if (!active) return;
+    uint32_t used = 0;
+    int res = miniflac_decode(decoder, &readBuffer[readBufferPos], readBufferLen - readBufferPos, &used, pcm);
+    readBufferPos += used;
+    if (res == MINIFLAC_OK) {
+        size_t blocksize = decoder->frame.header.block_size;
+        uint8_t ch = decoder->frame.header.channels;
+        uint8_t bits = decoder->frame.header.bps;
+        size_t outLen = 0;
+        // Interleave and pack samples for I2S
+        if (bits <= 8) {
+            for (size_t i = 0; i < blocksize; ++i) {
+                for (uint8_t c = 0; c < ch; ++c) {
+                    i2sBuffer[outLen++] = (uint8_t)(pcm[c][i] << (8 - bits));
+                }
+            }
+        } else if (bits <= 16) {
+            for (size_t i = 0; i < blocksize; ++i) {
+                for (uint8_t c = 0; c < ch; ++c) {
+                    int16_t sample = (int16_t)(pcm[c][i] << (16 - bits));
+                    i2sBuffer[outLen++] = sample & 0xFF;
+                    i2sBuffer[outLen++] = (sample >> 8) & 0xFF;
+                }
+            }
+        } else if (bits <= 24) {
+            for (size_t i = 0; i < blocksize; ++i) {
+                for (uint8_t c = 0; c < ch; ++c) {
+                    int32_t sample = pcm[c][i] << (24 - bits);
+                    i2sBuffer[outLen++] = sample & 0xFF;
+                    i2sBuffer[outLen++] = (sample >> 8) & 0xFF;
+                    i2sBuffer[outLen++] = (sample >> 16) & 0xFF;
+                }
+            }
+        } else if (bits <= 32) {
+            for (size_t i = 0; i < blocksize; ++i) {
+                for (uint8_t c = 0; c < ch; ++c) {
+                    int32_t sample = pcm[c][i];
+                    i2sBuffer[outLen++] = sample & 0xFF;
+                    i2sBuffer[outLen++] = (sample >> 8) & 0xFF;
+                    i2sBuffer[outLen++] = (sample >> 16) & 0xFF;
+                    i2sBuffer[outLen++] = (sample >> 24) & 0xFF;
+                }
+            }
+        }
+        size_t bytesWritten = 0;
+        esp_err_t err = i2s_write(I2S_NUM_0, i2sBuffer, outLen, &bytesWritten, portMAX_DELAY);
+        if (err != ESP_OK) {
+            Serial.printf("I2S write error: %d\n", err);
+            active = false;
+            return;
+        }
+        // Sync to next frame
+        if (miniflac_sync(decoder, &readBuffer[readBufferPos], readBufferLen - readBufferPos, &used) != MINIFLAC_OK) {
+            if (flacFile.available()) {
+                readBufferLen = flacFile.read(readBuffer, FLAC_READ_BUFFER_SIZE);
+                readBufferPos = 0;
+            } else {
+                Serial.println("End of file or read error");
+                active = false;
+                return;
+            }
+        } else {
+            readBufferPos += used;
+        }
+    } else if (res == 0) { // MINIFLAC_CONTINUE
+        if (flacFile.available()) {
+            readBufferLen = flacFile.read(readBuffer, FLAC_READ_BUFFER_SIZE);
+            readBufferPos = 0;
+        } else {
+            Serial.println("End of file or read error");
+            active = false;
+            return;
+        }
+    } else {
+        Serial.println("FLAC decode error!");
         active = false;
-        break;
-    }
-    xSemaphoreGive(sdMutex);
-    if (!active)
-    {
-        LOGLN("track finished, playing next");
-        delay(10);
-        nextTrack();
         return;
-    }
-    else if (now - lastBookmarkMs > 1000)
-    {
-        unsigned long now = millis();
-        uint32_t pos = 0;
-        if (fileSrc && fileSrc->isOpen())
-        {
-            pos = fileSrc->getPos();
-        }
-        else
-        {
-            LOGLN("fileSrc not open during bookmark getPos()");
-        }
-        if (pos >= 0)
-        {
-            xQueueSend(bookmarkQueue, &pos, 0);
-            lastBookmarkMs = now;
-            LOG("Queued bookmark %u @ %u bytes\n", currentIdx, pos);
-        }
     }
 }
