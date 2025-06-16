@@ -139,7 +139,41 @@ bool openFlacFile(const String& path) {
     return true;
 }
 
+// Minimal function to turn off a single WS2812/NeoPixel LED on pin 21
+void turnOffNeoPixel() {
+    const int pin = 21;
+    pinMode(pin, OUTPUT);
+    noInterrupts();
+    // Try all color orders: GRB, RGB, BRG
+    uint8_t patterns[3][3] = {
+        {0,0,0}, // GRB
+        {0,0,0}, // RGB
+        {0,0,0}  // BRG
+    };
+    for (int order = 0; order < 3; ++order) {
+        for (int c = 0; c < 3; ++c) {
+            for (int b = 7; b >= 0; --b) {
+                if (patterns[order][c] & (1 << b)) {
+                    digitalWrite(pin, HIGH);
+                    asm volatile ("nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop;");
+                    digitalWrite(pin, LOW);
+                    asm volatile ("nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop;");
+                } else {
+                    digitalWrite(pin, HIGH);
+                    asm volatile ("nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop;");
+                    digitalWrite(pin, LOW);
+                    asm volatile ("nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop;");
+                }
+            }
+        }
+        delayMicroseconds(100); // Latch (longer)
+    }
+    digitalWrite(pin, LOW); // Ensure pin is low after
+    interrupts();
+}
+
 void setup() {
+    turnOffNeoPixel(); // First thing after startup
     Serial.begin(115150);
     Serial.println("Starting setup...");
     pinMode(NEXT_BUTTON_PIN, INPUT_PULLUP);
