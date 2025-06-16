@@ -1,0 +1,105 @@
+diff --git a/miniflac.h b/miniflac.h
+index d36695e..cd5e5f3 100644
+--- a/miniflac.h
++++ b/miniflac.h
+@@ -659,9 +659,13 @@ typedef enum MINIFLAC_CONTAINER MINIFLAC_CONTAINER;
+ typedef enum MFLAC_RESULT MFLAC_RESULT;
+ 
+ #ifdef __cplusplus
+-extern "C" {
++#define MINIFLAC_EXTERN_C extern "C"
++#else
++#define MINIFLAC_EXTERN_C
+ #endif
+ 
++MINIFLAC_EXTERN_C {
++
+ /* returns the number of bytes needed for the miniflac struct (for malloc, etc) */
+ MINIFLAC_API
+ MINIFLAC_CONST
+@@ -1444,7 +1448,7 @@ mflac_version_string(void);
+ 
+ 
+ #ifdef __cplusplus
+-}
++} // extern "C"
+ #endif
+ 
+ #endif
+diff --git a/src/frame.h b/src/frame.h
+index 2fb1027..bceb01e 100644
+--- a/src/frame.h
++++ b/src/frame.h
+@@ -3,6 +3,7 @@
+ #define MINIFLAC_FRAME_H
+ 
+ #include <stdint.h>
++#include <stddef.h>
+ 
+ #include "common.h"
+ #include "bitreader.h"
+diff --git a/src/frameheader.h b/src/frameheader.h
+index 0587316..e78e5a8 100644
+--- a/src/frameheader.h
++++ b/src/frameheader.h
+@@ -3,6 +3,7 @@
+ #define MINIFLAC_FRAMEHEADER_H
+ 
+ #include <stdint.h>
++#include <stddef.h>
+ 
+ #include "common.h"
+ #include "bitreader.h"
+diff --git a/src/miniflac.h b/src/miniflac.h
+index 92cdc33..fbfc716 100644
+--- a/src/miniflac.h
++++ b/src/miniflac.h
+@@ -134,21 +134,29 @@ frame, or call miniflac_decode to continue on.
+ #define MINIFLAC_CONST
+ #endif
+ 
+-#inject enums
++// Error codes
++#define MINIFLAC_OK 0
++#define MINIFLAC_ERROR -1
+ 
+-#inject typedef_other
++// Callback types
++typedef size_t (*miniflac_read_callback)(void* user_data, void* buffer, size_t len);
++typedef void (*miniflac_write_callback)(const void* buffer, size_t len, void* user_data);
+ 
+-#inject structs
+-
+-#inject typedef_structs
+-
+-#inject typedef_enums
++// Main decoder structure
++typedef struct {
++    void* private_data;
++} miniflac_t;
+ 
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+ 
+-#inject public_function_declarations
++// Function declarations
++miniflac_t* miniflac_init(void);
++void miniflac_free(miniflac_t* decoder);
++void miniflac_set_read_callback(miniflac_t* decoder, miniflac_read_callback callback, void* user_data);
++void miniflac_set_write_callback(miniflac_t* decoder, miniflac_write_callback callback, void* user_data);
++int miniflac_decode(miniflac_t* decoder);
+ 
+ #ifdef __cplusplus
+ }
+@@ -165,8 +173,7 @@ extern "C" {
+ #define miniflac_abort()
+ #endif
+ 
+-#inject private_function_declarations
+-
+-#inject code
++// #inject private_function_declarations
++// #inject code
+ 
+ #endif
