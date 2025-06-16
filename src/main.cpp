@@ -12,8 +12,8 @@ extern "C" {
 #define I2S_BCLK 26
 #define I2S_LRC 25
 #define I2S_DOUT 22
-#define FLAC_READ_BUFFER_SIZE 16448
-#define FLAC_MAX_CHANNELS 8
+#define FLAC_READ_BUFFER_SIZE 4096
+#define FLAC_MAX_CHANNELS 2
 #define I2S_DMA_BUF_COUNT 8
 #define I2S_DMA_BUF_LEN 512
 #define NEXT_BUTTON_PIN 33
@@ -117,6 +117,10 @@ bool openFlacFile(const String& path) {
             channels = ch;
             bps = bps_val;
             blockSize = max_block;
+            if (sampleRate > 48000) {
+                Serial.printf("Skipping file: %s (sample rate %u Hz > 48000)\n", path.c_str(), sampleRate);
+                return false;
+            }
             Serial.printf("FLAC stream: %u Hz, %u ch, %u bps, blocksize %u\n", sampleRate, channels, bps, blockSize);
             for (int i = 0; i < FLAC_MAX_CHANNELS; ++i) {
                 if (pcm[i]) free(pcm[i]);
