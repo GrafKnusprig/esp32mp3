@@ -12,10 +12,10 @@ extern "C" {
 #define I2S_BCLK 26
 #define I2S_LRC 25
 #define I2S_DOUT 22
-#define FLAC_READ_BUFFER_SIZE 4096
+#define FLAC_READ_BUFFER_SIZE 16448
 #define FLAC_MAX_CHANNELS 8
 #define I2S_DMA_BUF_COUNT 8
-#define I2S_DMA_BUF_LEN 256*2
+#define I2S_DMA_BUF_LEN 512
 #define NEXT_BUTTON_PIN 33
 #define NEXT_BUTTON_DEBOUNCE_MS 200
 
@@ -38,14 +38,24 @@ int currentFileIndex = 0;
 unsigned long lastButtonPress = 0;
 bool nextRequested = false;
 
-void findAllFlacFiles(File dir, std::vector<String>& files) {
-    while (File entry = dir.openNextFile()) {
+void findAllFlacFiles(File dir, std::vector<String> &files, int depth = 0)
+{
+    if (depth > 2) return;
+    while (File entry = dir.openNextFile())
+    {
+        String path = entry.path();
+
+        // Skip hidden or system files
+        if (path.startsWith("/.") || path.indexOf("/._") != -1) {
+            entry.close();
+            continue;
+        }
+
         if (entry.isDirectory()) {
-            findAllFlacFiles(entry, files);
+            findAllFlacFiles(entry, files, depth + 1);
         } else {
-            String name = entry.name();
-            if (name.endsWith(".flac") || name.endsWith(".FLAC")) {
-                files.push_back(String(entry.path()));
+            if (path.endsWith(".flac") || path.endsWith(".FLAC")) {
+                files.push_back(path);
             }
         }
         entry.close();
